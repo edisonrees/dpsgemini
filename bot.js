@@ -310,10 +310,7 @@ function scheduleReconnect(reason = 'unknown') {
         createBot();
     }, delay);
 }
-    reconnectAttempts++;
-    console.log(`[Reconnect] Attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${RECONNECT_DELAY / 1000}s...`);
-    setTimeout(createBot, RECONNECT_DELAY);
-}
+
 
 // -------------------------------------------------------------------
 // CORE HANDLER
