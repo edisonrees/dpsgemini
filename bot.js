@@ -224,44 +224,54 @@ function setupBotEvents() {
     //   2. Pass straight through (no trigger word needed)
     // -------------------------------------------------------------------
     bot._client.on('packet', (data, meta) => {
-        try {
-            const chatPackets = ['chat', 'player_chat', 'system_chat', 'profileless_chat'];
-            if (!chatPackets.includes(meta.name)) return;
+    try {
+        const chatPackets = ['chat', 'player_chat', 'system_chat', 'profileless_chat'];
+        if (!chatPackets.includes(meta.name)) return;
 
-            // --- Whisper check first ---
-            const whisper = parseWhisperPacket(data);
-            if (whisper) {
-                const { realUsername, plainText } = parsed;
+        // -------------------------
+        // WHISPER FLOW
+        // -------------------------
+        const whisper = parseWhisperPacket(data);
+        if (whisper) {
+            const { realUsername, message } = whisper;
 
-if (realUsername === bot.username) return;
-
-// 🔥 Remove "<username>" prefix BEFORE anything else
-let cleanText = plainText.replace(/^<[^>]+>\s*/, '');
-
-// Only act if the message contains a trigger word
-if (!hasTrigger(cleanText)) return;
-
-const prompt = stripTrigger(cleanText);
-
-            const { realUsername, plainText } = parsed;
             if (realUsername === bot.username) return;
 
-            // Only act if the message contains a trigger word
-            if (!hasTrigger(plainText)) return;
-
-            const prompt = stripTrigger(plainText);
-            if (!prompt) {
-                safeChat(`/msg ${realUsername} Please provide a message after !gemini`);
-                return;
-            }
-
-            console.log(`[Chat] ${realUsername}: ${prompt}`);
-            handleGeminiRequest(realUsername, prompt, false, true);
-
-        } catch (err) {
-            console.error('[Error] Packet handler:', err);
+            console.log(`[Whisper] ${realUsername}: ${message}`);
+            handleGeminiRequest(realUsername, message, true);
+            return;
         }
-    });
+
+        // -------------------------
+        // PUBLIC CHAT FLOW
+        // -------------------------
+        const parsed = parsePacket(data);
+        if (!parsed) return;
+
+        let { realUsername, plainText } = parsed;
+
+        if (realUsername === bot.username) return;
+
+        // Remove "<username>" prefix if it exists
+        let cleanText = plainText.replace(/^<[^>]+>\s*/, '');
+
+        // Trigger check
+        if (!hasTrigger(cleanText)) return;
+
+        const prompt = stripTrigger(cleanText);
+
+        if (!prompt) {
+            safeChat(`/msg ${realUsername} Please provide a message after !gemini`);
+            return;
+        }
+
+        console.log(`[Chat] ${realUsername}: ${prompt}`);
+        handleGeminiRequest(realUsername, prompt, false, true);
+
+    } catch (err) {
+        console.error('[Error] Packet handler:', err);
+    }
+});
 
     // Whisper fallback (mineflayer native — fires if packet handler didn't catch it)
     bot.on('whisper', (username, message) => {
