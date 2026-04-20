@@ -50,7 +50,6 @@ const RECONNECT_DELAY = 15000;
 
 // -------------------------------------------------------------------
 // TRIGGER DETECTION
-// Matches: !g, !gemini, > !g, >!gemini, and variants with trailing comma
 // -------------------------------------------------------------------
 const TRIGGER_REGEX = /(?:^|>)\s*!g(?:emini)?,?\b/i;
 
@@ -103,17 +102,48 @@ function findClickEventValue(component) {
 }
 
 /**
- * Strip "/msg " (and trailing space) from the clickEvent value to get the real username.
- * e.g. "/msg Alice " -> "Alice"
+ * Recursively walk a component tree.
+ * Returns { lang, timePlayed, kills, deaths } from hoverEvent stats, or null.
+ */
+function findHoverStats(component) {
+    if (!component || typeof component !== 'object') return null;
+
+    if (component.hoverEvent?.action === 'show_text') {
+        const contents = component.hoverEvent.contents;
+        if (contents) {
+            const text = componentToPlainText(contents);
+            const lang       = text.match(/Lang:\s*(\S+)/i)?.[1] ?? null;
+            const timePlayed = text.match(/Time Played:\s*([\d.]+ \w+)/i)?.[1] ?? null;
+            const kills      = text.match(/Player Kills:\s*(\d+)/i)?.[1] ?? null;
+            const deaths     = text.match(/Player Deaths:\s*(\d+)/i)?.[1] ?? null;
+            if (lang || timePlayed || kills || deaths) {
+                return { lang, timePlayed, kills, deaths };
+            }
+        }
+    }
+
+    for (const child of (component.extra || [])) {
+        const found = findHoverStats(child);
+        if (found) return found;
+    }
+    for (const child of (component.with || [])) {
+        const found = findHoverStats(child);
+        if (found) return found;
+    }
+
+    return null;
+}
+
+/**
+ * Strip "/msg " from the clickEvent value to get the real username.
  */
 function realUsernameFromClickValue(value) {
-    // value is like "/msg Alice " or "/msg Alice"
     return value.replace(/^\/msg\s+/, '').trim();
 }
 
 /**
  * Parse a raw packet data object.
- * Returns { realUsername, plainText } or null.
+ * Returns { realUsername, plainText, hoverStats } or null.
  */
 function parsePacket(data) {
     const candidates = [
@@ -139,7 +169,8 @@ function parsePacket(data) {
         if (clickValue) {
             const realUsername = realUsernameFromClickValue(clickValue);
             const plainText = componentToPlainText(component);
-            return { realUsername, plainText };
+            const hoverStats = findHoverStats(component);
+            return { realUsername, plainText, hoverStats };
         }
     }
     return null;
@@ -209,73 +240,55 @@ function setupBotEvents() {
         setTimeout(tryLogin, 5000);
     });
 
-    // -------------------------------------------------------------------
-    // PRIMARY: raw packet interception via node-minecraft-protocol.
-    // Fires before mineflayer processes anything.
-    //
-    // Public chat flow:
-    //   1. Parse packet -> plainText + clickEvent value
-    //   2. Check plainText for trigger word
-    //   3. Strip "/msg " from clickEvent value -> real username
-    //   4. Strip trigger from plainText -> prompt
-    //
-    // Whisper flow:
-    //   1. Match whisper pattern -> real username + message
-    //   2. Pass straight through (no trigger word needed)
-    // -------------------------------------------------------------------
     bot._client.on('packet', (data, meta) => {
-    try {
-        const chatPackets = ['chat', 'player_chat', 'system_chat', 'profileless_chat'];
-        if (!chatPackets.includes(meta.name)) return;
+        try {
+            const chatPackets = ['chat', 'player_chat', 'system_chat', 'profileless_chat'];
+            if (!chatPackets.includes(meta.name)) return;
 
-        // -------------------------
-        // WHISPER FLOW
-        // -------------------------
-        const whisper = parseWhisperPacket(data);
-        if (whisper) {
-            const { realUsername, message } = whisper;
+            // -------------------------
+            // WHISPER FLOW
+            // -------------------------
+            const whisper = parseWhisperPacket(data);
+            if (whisper) {
+                const { realUsername, message } = whisper;
+                if (realUsername === bot.username) return;
+                console.log(`[Whisper] ${realUsername}: ${message}`);
+                handleGeminiRequest(realUsername, message, true);
+                return;
+            }
+
+            // -------------------------
+            // PUBLIC CHAT FLOW
+            // -------------------------
+            const parsed = parsePacket(data);
+            if (!parsed) return;
+
+            const { realUsername, plainText, hoverStats } = parsed;
 
             if (realUsername === bot.username) return;
 
-            console.log(`[Whisper] ${realUsername}: ${message}`);
-            handleGeminiRequest(realUsername, message, true);
-            return;
+            const cleanText = plainText
+                .replace(/^\[[^\]]+\]\s*/g, '')
+                .replace(/^<[^>]+>\s*/g, '');
+
+            if (!hasTrigger(cleanText)) return;
+
+            const prompt = stripTrigger(cleanText);
+
+            if (!prompt) {
+                safeChat(`/msg ${realUsername} Please provide a message after !gemini`);
+                return;
+            }
+
+            console.log(`[Chat] ${realUsername}: ${prompt}`);
+            handleGeminiRequest(realUsername, prompt, false, true, hoverStats);
+
+        } catch (err) {
+            console.error('[Error] Packet handler:', err);
         }
+    });
 
-        // -------------------------
-        // PUBLIC CHAT FLOW
-        // -------------------------
-        const parsed = parsePacket(data);
-        if (!parsed) return;
-
-        let { realUsername, plainText } = parsed;
-
-        if (realUsername === bot.username) return;
-
-        // Remove "<username>" prefix if it exists
-        let cleanText = plainText
-    .replace(/^\[[^\]]+\]\s*/g, '')   // remove [Ultra]
-    .replace(/^<[^>]+>\s*/g, '');     // remove <b>
-
-        // Trigger check
-        if (!hasTrigger(cleanText)) return;
-
-        const prompt = stripTrigger(cleanText);
-
-        if (!prompt) {
-            safeChat(`/msg ${realUsername} Please provide a message after !gemini`);
-            return;
-        }
-
-        console.log(`[Chat] ${realUsername}: ${prompt}`);
-        handleGeminiRequest(realUsername, prompt, false, true);
-
-    } catch (err) {
-        console.error('[Error] Packet handler:', err);
-    }
-});
-
-    // Whisper fallback (mineflayer native — fires if packet handler didn't catch it)
+    // Whisper fallback (mineflayer native)
     bot.on('whisper', (username, message) => {
         try {
             console.log(`[Whisper] ${username}: ${message}`);
@@ -305,31 +318,25 @@ function scheduleReconnect(reason = 'unknown') {
     reconnecting = true;
     reconnectAttempts++;
 
-    // 🔥 Exponential backoff (IMPORTANT)
     const delay = Math.min(300000, RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts));
-
-    console.log(`[Reconnect] Attempt ${reconnectAttempts} in ${Math.round(delay/1000)}s (${reason})`);
+    console.log(`[Reconnect] Attempt ${reconnectAttempts} in ${Math.round(delay / 1000)}s (${reason})`);
 
     setTimeout(() => {
         reconnecting = false;
-
         try {
             if (bot) {
                 bot.removeAllListeners();
                 bot.quit();
             }
         } catch {}
-
         createBot();
     }, delay);
 }
 
-
 // -------------------------------------------------------------------
 // CORE HANDLER
-// alreadyStripped = true means trigger word already removed from message
 // -------------------------------------------------------------------
-async function handleGeminiRequest(username, message, isWhisper, alreadyStripped = false) {
+async function handleGeminiRequest(username, message, isWhisper, alreadyStripped = false, hoverStats = null) {
     if (!username || !message) return;
     if (username === bot.username) return;
 
@@ -344,13 +351,10 @@ async function handleGeminiRequest(username, message, isWhisper, alreadyStripped
     let prompt;
 
     if (isWhisper) {
-        // Whispers don't require a trigger word — the whole message is the prompt
         prompt = normalizedMessage;
     } else if (alreadyStripped) {
-        // Packet handler already confirmed trigger + stripped it
         prompt = normalizedMessage;
     } else {
-        // Fallback path: check for trigger ourselves
         if (!hasTrigger(normalizedMessage)) return;
         prompt = stripTrigger(normalizedMessage);
     }
@@ -368,7 +372,7 @@ async function handleGeminiRequest(username, message, isWhisper, alreadyStripped
     userConversations.set(username, history);
 
     try {
-        await processRequest(username, prompt, isWhisper, requestId, history);
+        await processRequest(username, prompt, isWhisper, requestId, history, hoverStats);
     } catch (err) {
         console.error(`[Error] Request from ${username} failed:`, err);
         safeChat(`/msg ${username} Request failed. Please try again.`);
@@ -377,7 +381,7 @@ async function handleGeminiRequest(username, message, isWhisper, alreadyStripped
     }
 }
 
-async function processRequest(username, prompt, isWhisper, requestId, history) {
+async function processRequest(username, prompt, isWhisper, requestId, history, hoverStats = null) {
     const isExempt = username.toLowerCase() === 'freddison';
 
     if (!isExempt) {
@@ -399,22 +403,27 @@ async function processRequest(username, prompt, isWhisper, requestId, history) {
     lastApiCall = Date.now();
 
     console.log(`[Request] ${username}: ${prompt.substring(0, 100)}`);
-    const response = await callGeminiWithRetry(username, history);
+    const response = await callGeminiWithRetry(username, history, 1, hoverStats);
     if (response) sendSmartChat(response, username, isWhisper);
 }
 
-async function callGeminiWithRetry(username, history, attempt = 1) {
+async function callGeminiWithRetry(username, history, attempt = 1, hoverStats = null) {
     try {
         const conversationText = history
             .map(m => `${m.role === "user" ? "User" : "Bot"}: ${m.content}`)
             .join("\n");
+
+        const lang       = hoverStats?.lang       ?? 'en_us';
+        const timePlayed = hoverStats?.timePlayed  ?? 'unknown';
+        const kills      = hoverStats?.kills       ?? 'unknown';
+        const deaths     = hoverStats?.deaths      ?? 'unknown';
 
         const fullPrompt = `You are a helpful chat bot.
 
 Conversation so far:
 ${conversationText}
 
-Respond to the latest user message in under 600 characters (but lean to lower responses for easier questions). Be concise and friendly. No markdown. You are DPS_Gemini, a service bot for DPS (Dead Poets Society), a minecraft clan on 8b8t, who is the best 8b8t clan due to their unrivalled supremacy. DO NOT BE OVERLY PATRIOTIC! Do not bring up DPS in a chat unless it is 100% relevant. You were made by freddison for KurtzMC`;
+Respond to the latest user message in under 600 characters (but lean to lower responses for easier questions). Be concise and friendly. No markdown. You are DPS_Gemini, a service bot for DPS (Dead Poets Society), a minecraft clan on 8b8t, who is the best 8b8t clan due to their unrivalled supremacy. DO NOT BE OVERLY PATRIOTIC! Do not bring up DPS in a chat unless it is 100% relevant. You were made by freddison for KurtzMC. This user's username is: ${username}, they have played on the server for ${timePlayed}, They have died ${deaths} amount of times, and killed ${kills} amount of players. Respond to the user in ${lang}.`;
 
         const response = await ai.models.generateContent({
             model: "gemini-2.5-flash",
@@ -422,7 +431,6 @@ Respond to the latest user message in under 600 characters (but lean to lower re
             config: {
                 systemInstruction: "You are a helpful chat bot. Keep responses under 200 characters. Be concise and friendly.",
                 thinkingConfig: { thinkingLevel: ThinkingLevel.NONE },
-                
             }
         });
 
@@ -452,7 +460,7 @@ Respond to the latest user message in under 600 characters (but lean to lower re
         }
         if (attempt < MAX_RETRIES) {
             await sleep(RETRY_DELAY * attempt);
-            return callGeminiWithRetry(username, history, attempt + 1);
+            return callGeminiWithRetry(username, history, attempt + 1, hoverStats);
         }
         safeChat(`/msg ${username} API error after ${MAX_RETRIES} attempts. Try again later.`);
         return null;
