@@ -78,6 +78,14 @@ function setupBotEvents() {
     });
 
     // Public Chat Listener with error handling
+     bot.on('chat', (username, message) => {
+        try {
+            handleGeminiRequest(username, message, false);
+        } catch (err) {
+            console.error('[Error] Chat handler failed:', err);
+        }
+    });
+    
     bot.once('spawn', () => {
     console.log('[Bot] Spawned, waiting for chat readiness...');
 
