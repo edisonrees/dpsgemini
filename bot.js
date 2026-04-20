@@ -49,11 +49,21 @@ const MAX_RECONNECT_ATTEMPTS = 10000;
 const RECONNECT_DELAY = 15000;
 
 // -------------------------------------------------------------------
-// RAW PACKET EXTRACTION
-// The cosmetic nick plugin injects the REAL username into every chat
-// message's clickEvent (suggestCommand: "/msg <realName> ") because
-// it calls player.getName() there, not the display name.
-// We read this before mineflayer touches anything.
+// TRIGGER DETECTION
+// Matches: !g, !gemini, > !g, >!gemini, and variants with trailing comma
+// -------------------------------------------------------------------
+const TRIGGER_REGEX = /(?:^|>)\s*!g(?:emini)?,?\b/i;
+
+function hasTrigger(text) {
+    return TRIGGER_REGEX.test(text);
+}
+
+function stripTrigger(text) {
+    return text.replace(/(?:^|>)\s*!g(?:emini)?,?\s*/gi, '').trim();
+}
+
+// -------------------------------------------------------------------
+// COMPONENT TREE HELPERS
 // -------------------------------------------------------------------
 
 function componentToPlainText(component) {
@@ -68,98 +78,95 @@ function componentToPlainText(component) {
     return text;
 }
 
-function extractRealNameFromClickEvent(component) {
+/**
+ * Recursively walk a component tree.
+ * Returns the first suggestCommand clickEvent value that starts with "/msg ".
+ */
+function findClickEventValue(component) {
     if (!component || typeof component !== 'object') return null;
 
-    if (component.clickEvent) {
-        const { action, value } = component.clickEvent;
-        if (action === 'suggest_command' && typeof value === 'string') {
-            const match = value.match(/^\/msg\s+(\S+)/i);
-            if (match) return match[1];
-        }
+    if (component.clickEvent?.action === 'suggest_command') {
+        const val = component.clickEvent.value || '';
+        if (val.startsWith('/msg ')) return val;
     }
 
-    if (Array.isArray(component.extra)) {
-        for (const child of component.extra) {
-            const found = extractRealNameFromClickEvent(child);
-            if (found) return found;
-        }
+    for (const child of (component.extra || [])) {
+        const found = findClickEventValue(child);
+        if (found) return found;
     }
-
-    if (Array.isArray(component.with)) {
-        for (const child of component.with) {
-            const found = extractRealNameFromClickEvent(child);
-            if (found) return found;
-        }
+    for (const child of (component.with || [])) {
+        const found = findClickEventValue(child);
+        if (found) return found;
     }
 
     return null;
 }
 
-function parseRawChatPacket(data) {
-    // Try every field that might contain the JSON chat component
-    const rawFields = [
+/**
+ * Strip "/msg " (and trailing space) from the clickEvent value to get the real username.
+ * e.g. "/msg Alice " -> "Alice"
+ */
+function realUsernameFromClickValue(value) {
+    // value is like "/msg Alice " or "/msg Alice"
+    return value.replace(/^\/msg\s+/, '').trim();
+}
+
+/**
+ * Parse a raw packet data object.
+ * Returns { realUsername, plainText } or null.
+ */
+function parsePacket(data) {
+    const candidates = [
         data.message,
         data.signedChat,
         data.unsignedContent,
         data.chatMessage,
         data.data,
+        data.content,
     ];
 
-    for (const raw of rawFields) {
+    for (const raw of candidates) {
         if (!raw) continue;
-
         let component;
         try {
             component = typeof raw === 'string' ? JSON.parse(raw) : raw;
         } catch {
             continue;
         }
+        if (typeof component !== 'object') continue;
 
-        const realUsername = extractRealNameFromClickEvent(component);
-        if (realUsername) {
+        const clickValue = findClickEventValue(component);
+        if (clickValue) {
+            const realUsername = realUsernameFromClickValue(clickValue);
             const plainText = componentToPlainText(component);
-
-            // Strip the display portion and isolate just the message body.
-            // Chat lines look like: "[RANK] NickName: hello" or "<Nick> hello"
-            let messageBody = plainText;
-            // Remove rank/prefix blocks: [VIP], (Admin), etc.
-            messageBody = messageBody.replace(/^(?:\s*[\[\(][^\]\)]*[\]\)]\s*)+/, '').trim();
-            // Remove the leading name chunk (everything up to first ": " or "> " or " ")
-            const separatorMatch = messageBody.match(/^[^\s:>»]+[\s:>»]+(.*)$/);
-            if (separatorMatch) {
-                messageBody = separatorMatch[1].trim();
-            }
-
-            return { realUsername, message: messageBody };
+            return { realUsername, plainText };
         }
     }
-
     return null;
 }
 
-function extractWhisperFromRaw(data) {
-    const whisperPatterns = [
-        /^(\w+)\s+whispers(?:\s+to\s+you)?:\s*(.+)$/i,
-        /^(\w+)\s+whispers:\s*(.+)$/i,
-        /^\[(\w+)\s*->\s*me\]\s*(.+)$/i,
-        /^From\s+(\w+):\s*(.+)$/i,
-        /^(\w+)\s*»\s*(.+)$/i,
-        /^(\w+)\s*→\s*(.+)$/i,
-    ];
+// -------------------------------------------------------------------
+// WHISPER EXTRACTION (system messages — real name in plain text)
+// -------------------------------------------------------------------
+const WHISPER_PATTERNS = [
+    /^(\w+)\s+whispers(?:\s+to\s+you)?:\s*(.+)$/i,
+    /^(\w+)\s+whispers:\s*(.+)$/i,
+    /^\[(\w+)\s*->\s*me\]\s*(.+)$/i,
+    /^From\s+(\w+):\s*(.+)$/i,
+    /^(\w+)\s*»\s*(.+)$/i,
+    /^(\w+)\s*→\s*(.+)$/i,
+];
 
-    const rawFields = [data.content, data.message, data.data];
-
-    for (const raw of rawFields) {
+function parseWhisperPacket(data) {
+    const candidates = [data.content, data.message, data.data];
+    for (const raw of candidates) {
         if (!raw) continue;
-        let plainText = raw;
+        let text = raw;
         if (typeof raw === 'string' && raw.trim().startsWith('{')) {
-            try {
-                plainText = componentToPlainText(JSON.parse(raw));
-            } catch { /* not JSON */ }
+            try { text = componentToPlainText(JSON.parse(raw)); } catch { /* not JSON */ }
         }
-        for (const pattern of whisperPatterns) {
-            const match = plainText.match(pattern);
+        for (const pattern of WHISPER_PATTERNS) {
+            const match = text.match(pattern);
             if (match) return { realUsername: match[1], message: match[2].trim() };
         }
     }
@@ -203,63 +210,72 @@ function setupBotEvents() {
     });
 
     // -------------------------------------------------------------------
-    // PRIMARY: intercept raw packets via node-minecraft-protocol.
-    // This fires before mineflayer parses anything, so we see the full
-    // JSON component including the clickEvent with the real username.
+    // PRIMARY: raw packet interception via node-minecraft-protocol.
+    // Fires before mineflayer processes anything.
+    //
+    // Public chat flow:
+    //   1. Parse packet -> plainText + clickEvent value
+    //   2. Check plainText for trigger word
+    //   3. Strip "/msg " from clickEvent value -> real username
+    //   4. Strip trigger from plainText -> prompt
+    //
+    // Whisper flow:
+    //   1. Match whisper pattern -> real username + message
+    //   2. Pass straight through (no trigger word needed)
     // -------------------------------------------------------------------
     bot._client.on('packet', (data, meta) => {
         try {
             const chatPackets = ['chat', 'player_chat', 'system_chat', 'profileless_chat'];
             if (!chatPackets.includes(meta.name)) return;
 
-            // Debug: log packet structure so you can tune parsing if needed
-            console.log(`[Packet] name=${meta.name} keys=${Object.keys(data).join(',')}`);
-
-            // --- Whisper detection first ---
-            const whisper = extractWhisperFromRaw(data);
+            // --- Whisper check first ---
+            const whisper = parseWhisperPacket(data);
             if (whisper) {
                 const { realUsername, message } = whisper;
                 if (realUsername === bot.username) return;
-                console.log(`[Packet/Whisper] Real: ${realUsername} | Msg: ${message}`);
+                console.log(`[Whisper] ${realUsername}: ${message}`);
                 handleGeminiRequest(realUsername, message, true);
                 return;
             }
 
-            // --- Public chat with clickEvent extraction ---
-            const chat = parseRawChatPacket(data);
-            if (chat) {
-                const { realUsername, message } = chat;
-                if (realUsername === bot.username) return;
-                console.log(`[Packet/Chat] Real: ${realUsername} | Msg: ${message}`);
-                handleGeminiRequest(realUsername, message, false);
+            // --- Public chat ---
+            const parsed = parsePacket(data);
+            if (!parsed) return;
+
+            const { realUsername, plainText } = parsed;
+            if (realUsername === bot.username) return;
+
+            // Only act if the message contains a trigger word
+            if (!hasTrigger(plainText)) return;
+
+            const prompt = stripTrigger(plainText);
+            if (!prompt) {
+                safeChat(`/msg ${realUsername} Please provide a message after !gemini`);
                 return;
             }
 
-            // If neither matched, log the raw fields so you can debug
-            console.log(`[Packet/NoMatch] Dumping fields for debugging:`);
-            for (const [k, v] of Object.entries(data)) {
-                if (v != null) console.log(`  ${k}: ${String(v).substring(0, 300)}`);
-            }
+            console.log(`[Chat] ${realUsername}: ${prompt}`);
+            handleGeminiRequest(realUsername, prompt, false, true);
 
         } catch (err) {
-            console.error('[Error] Raw packet handler failed:', err);
+            console.error('[Error] Packet handler:', err);
         }
     });
 
-    // Whisper fallback (mineflayer native, for vanilla-format servers)
+    // Whisper fallback (mineflayer native — fires if packet handler didn't catch it)
     bot.on('whisper', (username, message) => {
         try {
-            console.log(`[Whisper/fallback] ${username}: ${message}`);
+            console.log(`[Whisper] ${username}: ${message}`);
             handleGeminiRequest(username, message, true);
         } catch (err) {
-            console.error('[Error] Whisper handler failed:', err);
+            console.error('[Error] Whisper handler:', err);
         }
     });
 
-    bot.on('error', (err) => console.error('[Bot Error]', err));
+    bot.on('error', (err) => console.error('[Bot Error]', err.message || err));
     bot.on('kicked', (reason) => { console.log('[Kicked]', reason); scheduleReconnect(); });
-    bot.on('end', (reason) => { console.log('[Bot] Disconnected:', reason); scheduleReconnect(); });
-    bot.on('login', () => console.log('[Bot] Logged in successfully'));
+    bot.on('end', (reason) => { console.log('[Disconnected]', reason); scheduleReconnect(); });
+    bot.on('login', () => console.log('[Bot] Logged in'));
 }
 
 function scheduleReconnect() {
@@ -274,50 +290,53 @@ function scheduleReconnect() {
 
 // -------------------------------------------------------------------
 // CORE HANDLER
+// alreadyStripped = true means trigger word already removed from message
 // -------------------------------------------------------------------
-async function handleGeminiRequest(username, message, isWhisper) {
+async function handleGeminiRequest(username, message, isWhisper, alreadyStripped = false) {
     if (!username || !message) return;
     if (username === bot.username) return;
 
     if (!approvedPlayers.has(username.toLowerCase())) {
-        console.log(`[Blocked] ${username} not in approved list`);
+        console.log(`[Blocked] ${username} is not an approved player`);
         return;
     }
 
     const normalizedMessage = message.trim();
     if (!normalizedMessage) return;
 
-    const words = normalizedMessage.toLowerCase().split(/\s+/);
-    const triggerIndex = words.findIndex(
-        w => w === '!gemini' || w === '!g' || w === '> !g' || w === '> !gemini'
-    );
+    let prompt;
 
-    if ((triggerIndex !== -1 && triggerIndex < 3) || isWhisper === true) {
-        const prompt = normalizedMessage
-            .replace(/!gemini/gi, '')
-            .replace(/!g(?:\s|$)/gi, '')
-            .trim();
+    if (isWhisper) {
+        // Whispers don't require a trigger word — the whole message is the prompt
+        prompt = normalizedMessage;
+    } else if (alreadyStripped) {
+        // Packet handler already confirmed trigger + stripped it
+        prompt = normalizedMessage;
+    } else {
+        // Fallback path: check for trigger ourselves
+        if (!hasTrigger(normalizedMessage)) return;
+        prompt = stripTrigger(normalizedMessage);
+    }
 
-        if (!prompt) {
-            safeChat(`/msg ${username} Please provide a message after !gemini`);
-            return;
-        }
+    if (!prompt) {
+        safeChat(`/msg ${username} Please provide a message after !gemini`);
+        return;
+    }
 
-        const requestId = `${username}-${Date.now()}`;
-        if (pendingRequests.has(requestId)) return;
-        pendingRequests.add(requestId);
+    const requestId = `${username}-${Date.now()}`;
+    if (pendingRequests.has(requestId)) return;
+    pendingRequests.add(requestId);
 
-        const history = userConversations.get(username) || [];
-        userConversations.set(username, history);
+    const history = userConversations.get(username) || [];
+    userConversations.set(username, history);
 
-        try {
-            await processRequest(username, prompt, isWhisper, requestId, history);
-        } catch (err) {
-            console.error('[Error] Request processing failed:', err);
-            safeChat(`/msg ${username} Request failed. Please try again.`);
-        } finally {
-            setTimeout(() => pendingRequests.delete(requestId), 10000);
-        }
+    try {
+        await processRequest(username, prompt, isWhisper, requestId, history);
+    } catch (err) {
+        console.error(`[Error] Request from ${username} failed:`, err);
+        safeChat(`/msg ${username} Request failed. Please try again.`);
+    } finally {
+        setTimeout(() => pendingRequests.delete(requestId), 10000);
     }
 }
 
@@ -337,8 +356,6 @@ async function processRequest(username, prompt, isWhisper, requestId, history) {
     }
 
     history.push({ role: "user", content: prompt });
-
-    if (!isWhisper && !isExempt && !prompt.startsWith('!')) return;
 
     const delay = Math.max(0, (lastApiCall + 5000) - Date.now());
     if (delay > 0) await sleep(delay);
