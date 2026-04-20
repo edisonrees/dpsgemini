@@ -10,7 +10,7 @@ const botArgs = {
     auth: 'offline',
     version: '1.20.1'
 };
-
+let reconnecting = false;
 let approvedPlayers = new Set();
 
 function loadApprovedPlayers() {
@@ -278,11 +278,38 @@ function setupBotEvents() {
     bot.on('login', () => console.log('[Bot] Logged in'));
 }
 
-function scheduleReconnect() {
+function scheduleReconnect(reason = 'unknown') {
+    if (reconnecting) {
+        console.log('[Reconnect] Already scheduled, skipping...');
+        return;
+    }
+
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
         console.error('[Fatal] Max reconnect attempts reached.');
         process.exit(1);
     }
+
+    reconnecting = true;
+    reconnectAttempts++;
+
+    // 🔥 Exponential backoff (IMPORTANT)
+    const delay = Math.min(300000, RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts));
+
+    console.log(`[Reconnect] Attempt ${reconnectAttempts} in ${Math.round(delay/1000)}s (${reason})`);
+
+    setTimeout(() => {
+        reconnecting = false;
+
+        try {
+            if (bot) {
+                bot.removeAllListeners();
+                bot.quit();
+            }
+        } catch {}
+
+        createBot();
+    }, delay);
+}
     reconnectAttempts++;
     console.log(`[Reconnect] Attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${RECONNECT_DELAY / 1000}s...`);
     setTimeout(createBot, RECONNECT_DELAY);
