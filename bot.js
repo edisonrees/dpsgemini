@@ -78,13 +78,27 @@ function setupBotEvents() {
     });
 
     // Public Chat Listener with error handling
-    bot.on('chat', (username, message) => {
-        try {
-            handleGeminiRequest(username, message, false);
-        } catch (err) {
-            console.error('[Error] Chat handler failed:', err);
+    bot.once('spawn', () => {
+    console.log('[Bot] Spawned, waiting for chat readiness...');
+
+    const tryLogin = () => {
+        if (bot && bot.chat) {
+            try {
+                bot.chat(`/login ${PASSWORD}`);
+                console.log('[Bot] Login command sent');
+            } catch (err) {
+                console.error('[Error] Login failed, retrying...', err.message);
+                setTimeout(tryLogin, 3000);
+            }
+        } else {
+            console.log('[Bot] Chat not ready yet, retrying...');
+            setTimeout(tryLogin, 3000);
         }
-    });
+    };
+
+    // wait a bit longer before first attempt
+    setTimeout(tryLogin, 5000);
+});
 
     // Whisper Listener
     bot.on('whisper', (username, message) => {
