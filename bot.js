@@ -10,9 +10,39 @@ const botArgs = {
     auth: 'offline',
     version: '1.20.1'
 };
-let reconnecting = false;
+
+const API_KEY  = process.env.API_KEY;
+const PASSWORD = process.env.MC_PASSWORD;
+
+const ai = new GoogleGenAI({ apiKey: API_KEY });
+
+// --- STATE ---
+let bot;
+let reconnecting        = false;
+let reconnectAttempts   = 0;
+const MAX_RECONNECT_ATTEMPTS = 10000;
+const RECONNECT_DELAY        = 15000;
+
 let approvedPlayers = new Set();
 
+const userCooldowns     = new Map();
+const userConversations = new Map();
+const pendingRequests   = new Set();
+
+const MSG_LIMIT   = 5;
+const TIME_WINDOW = 2 * 60 * 1000;   // 2 minutes
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 2000;
+const API_GAP_MS  = 5000;            // minimum ms between Gemini calls
+let lastApiCall   = 0;
+
+// Track which usernames were already handled by the packet handler
+// so the native `whisper` event doesn't double-fire.
+const handledByPacket = new Set();
+
+// -------------------------------------------------------------------
+// APPROVED PLAYERS
+// -------------------------------------------------------------------
 function loadApprovedPlayers() {
     try {
         const data = fs.readFileSync('approved_players.txt', 'utf8');
@@ -28,49 +58,20 @@ function loadApprovedPlayers() {
     }
 }
 
-const API_KEY = process.env.API_KEY;
-const PASSWORD = process.env.MC_PASSWORD;
-
-const ai = new GoogleGenAI({ apiKey: API_KEY });
-
-// --- STORAGE ---
-const userCooldowns = new Map();
-const userConversations = new Map();
-const MSG_LIMIT = 5;
-const TIME_WINDOW = 2 * 60 * 1000;
-let lastApiCall = 0;
-const pendingRequests = new Set();
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 2000;
-
-let bot;
-let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 10000;
-const RECONNECT_DELAY = 15000;
-
 // -------------------------------------------------------------------
 // DPS NEWS
 // -------------------------------------------------------------------
 const DPS_NEWS_PATH = 'dps_news.txt';
 
-/**
- * Load dps_news.txt and return its contents.
- * Returns null if the file cannot be read.
- */
 function loadDpsNews() {
     try {
-        return fs.readFileSync(DPS_NEWS_PATH, 'utf8').trim();
+        return fs.readFileSync(DPS_NEWS_PATH, 'utf8').trim() || null;
     } catch (err) {
         console.error('[News] Failed to load dps_news.txt:', err.message);
         return null;
     }
 }
 
-/**
- * The Gemini response must contain exactly "Gathering Data..." (case-insensitive)
- * as its entire meaningful content for us to trigger a news lookup.
- * We do NOT allow the user to force this — the model decides independently.
- */
 const GATHERING_DATA_REGEX = /^\s*Gathering Data\.{3}\s*$/i;
 
 function isGatheringData(text) {
@@ -82,27 +83,17 @@ function isGatheringData(text) {
 // -------------------------------------------------------------------
 const TRIGGER_REGEX = /(?:^|>)\s*!g(?:emini)?,?\b/i;
 
-function hasTrigger(text) {
-    return TRIGGER_REGEX.test(text);
-}
-
-function stripTrigger(text) {
-    return text.replace(/(?:^|>)\s*!g(?:emini)?,?\s*/gi, '').trim();
-}
+function hasTrigger(text)  { return TRIGGER_REGEX.test(text); }
+function stripTrigger(text) { return text.replace(/(?:^|>)\s*!g(?:emini)?,?\s*/gi, '').trim(); }
 
 // -------------------------------------------------------------------
 // COMPONENT TREE HELPERS
 // -------------------------------------------------------------------
-
 function componentToPlainText(component) {
     if (typeof component === 'string') return component;
     let text = component.text || '';
-    if (Array.isArray(component.extra)) {
-        text += component.extra.map(componentToPlainText).join('');
-    }
-    if (Array.isArray(component.with)) {
-        text += component.with.map(componentToPlainText).join('');
-    }
+    if (Array.isArray(component.extra)) text += component.extra.map(componentToPlainText).join('');
+    if (Array.isArray(component.with))  text += component.with.map(componentToPlainText).join('');
     return text;
 }
 
@@ -128,14 +119,12 @@ function findHoverStats(component) {
     if (component.hoverEvent?.action === 'show_text') {
         const contents = component.hoverEvent.contents;
         if (contents) {
-            const text = componentToPlainText(contents);
-            const lang       = text.match(/Lang:\s*(\S+)/i)?.[1] ?? null;
+            const text       = componentToPlainText(contents);
+            const lang       = text.match(/Lang:\s*(\S+)/i)?.[1]             ?? null;
             const timePlayed = text.match(/Time Played:\s*([\d.]+ \w+)/i)?.[1] ?? null;
-            const kills      = text.match(/Player Kills:\s*(\d+)/i)?.[1] ?? null;
-            const deaths     = text.match(/Player Deaths:\s*(\d+)/i)?.[1] ?? null;
-            if (lang || timePlayed || kills || deaths) {
-                return { lang, timePlayed, kills, deaths };
-            }
+            const kills      = text.match(/Player Kills:\s*(\d+)/i)?.[1]     ?? null;
+            const deaths     = text.match(/Player Deaths:\s*(\d+)/i)?.[1]    ?? null;
+            if (lang || timePlayed || kills || deaths) return { lang, timePlayed, kills, deaths };
         }
     }
     for (const child of (component.extra || [])) {
@@ -154,29 +143,19 @@ function realUsernameFromClickValue(value) {
 }
 
 function parsePacket(data) {
-    const candidates = [
-        data.message,
-        data.signedChat,
-        data.unsignedContent,
-        data.chatMessage,
-        data.data,
-        data.content,
-    ];
+    const candidates = [data.message, data.signedChat, data.unsignedContent, data.chatMessage, data.data, data.content];
     for (const raw of candidates) {
         if (!raw) continue;
         let component;
-        try {
-            component = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        } catch {
-            continue;
-        }
+        try { component = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { continue; }
         if (typeof component !== 'object') continue;
         const clickValue = findClickEventValue(component);
         if (clickValue) {
-            const realUsername = realUsernameFromClickValue(clickValue);
-            const plainText = componentToPlainText(component);
-            const hoverStats = findHoverStats(component);
-            return { realUsername, plainText, hoverStats };
+            return {
+                realUsername: realUsernameFromClickValue(clickValue),
+                plainText:    componentToPlainText(component),
+                hoverStats:   findHoverStats(component),
+            };
         }
     }
     return null;
@@ -213,23 +192,23 @@ function parseWhisperPacket(data) {
 // -------------------------------------------------------------------
 // BOT INITIALIZATION
 // -------------------------------------------------------------------
+loadApprovedPlayers();
+
 function createBot() {
     try {
         bot = mineflayer.createBot(botArgs);
         setupBotEvents();
-        reconnectAttempts = 0;
         console.log('[Bot] Initializing...');
     } catch (err) {
         console.error('[Fatal] Failed to create bot:', err);
-        scheduleReconnect();
+        scheduleReconnect('create-failed');
     }
 }
-
-loadApprovedPlayers();
 
 function setupBotEvents() {
     bot.once('spawn', () => {
         console.log('[Bot] Spawned, waiting for chat readiness...');
+        reconnectAttempts = 0; // reset on successful spawn
         const tryLogin = () => {
             if (bot?.chat) {
                 try {
@@ -251,21 +230,20 @@ function setupBotEvents() {
             const chatPackets = ['chat', 'player_chat', 'system_chat', 'profileless_chat'];
             if (!chatPackets.includes(meta.name)) return;
 
-            // -------------------------
-            // WHISPER FLOW
-            // -------------------------
+            // ── WHISPER FLOW ──────────────────────────────────────────
             const whisper = parseWhisperPacket(data);
             if (whisper) {
                 const { realUsername, message } = whisper;
                 if (realUsername === bot.username) return;
-                console.log(`[Whisper] ${realUsername}: ${message}`);
+                console.log(`[Whisper/packet] ${realUsername}: ${message}`);
+                // Mark so the native whisper event doesn't double-fire
+                handledByPacket.add(realUsername);
+                setTimeout(() => handledByPacket.delete(realUsername), 2000);
                 handleGeminiRequest(realUsername, message, true);
                 return;
             }
 
-            // -------------------------
-            // PUBLIC CHAT FLOW
-            // -------------------------
+            // ── PUBLIC CHAT FLOW ──────────────────────────────────────
             const parsed = parsePacket(data);
             if (!parsed) return;
 
@@ -285,27 +263,28 @@ function setupBotEvents() {
             }
 
             console.log(`[Chat] ${realUsername}: ${prompt}`);
-            handleGeminiRequest(realUsername, prompt, false, true, hoverStats);
+            handleGeminiRequest(realUsername, prompt, false, hoverStats);
 
         } catch (err) {
             console.error('[Error] Packet handler:', err);
         }
     });
 
-    // Whisper fallback (mineflayer native)
+    // Native whisper fallback — only fires if packet handler missed it
     bot.on('whisper', (username, message) => {
         try {
-            console.log(`[Whisper] ${username}: ${message}`);
+            if (handledByPacket.has(username)) return; // already handled above
+            console.log(`[Whisper/native] ${username}: ${message}`);
             handleGeminiRequest(username, message, true);
         } catch (err) {
             console.error('[Error] Whisper handler:', err);
         }
     });
 
-    bot.on('error', (err) => console.error('[Bot Error]', err.message || err));
-    bot.on('kicked', (reason) => { console.log('[Kicked]', reason); scheduleReconnect(); });
-    bot.on('end', (reason) => { console.log('[Disconnected]', reason); scheduleReconnect(); });
-    bot.on('login', () => console.log('[Bot] Logged in'));
+    bot.on('login',  ()       => console.log('[Bot] Logged in'));
+    bot.on('error',  (err)    => console.error('[Bot Error]', err.message || err));
+    bot.on('kicked', (reason) => { console.log('[Kicked]', reason);        scheduleReconnect('kicked'); });
+    bot.on('end',    (reason) => { console.log('[Disconnected]', reason);  scheduleReconnect('disconnected'); });
 }
 
 function scheduleReconnect(reason = 'unknown') {
@@ -374,7 +353,7 @@ You must NEVER respond with "Gathering Data..." for any reason other than genuin
 // -------------------------------------------------------------------
 // CORE HANDLER
 // -------------------------------------------------------------------
-async function handleGeminiRequest(username, message, isWhisper, alreadyStripped = false, hoverStats = null) {
+async function handleGeminiRequest(username, message, isWhisper, hoverStats = null) {
     if (!username || !message) return;
     if (username === bot.username) return;
 
@@ -383,42 +362,30 @@ async function handleGeminiRequest(username, message, isWhisper, alreadyStripped
         return;
     }
 
-    const normalizedMessage = message.trim();
-    if (!normalizedMessage) return;
-
-    let prompt;
-    if (isWhisper) {
-        prompt = normalizedMessage;
-    } else if (alreadyStripped) {
-        prompt = normalizedMessage;
-    } else {
-        if (!hasTrigger(normalizedMessage)) return;
-        prompt = stripTrigger(normalizedMessage);
-    }
-
+    const prompt = message.trim();
     if (!prompt) {
         safeChat(`/msg ${username} Please provide a message after !gemini`);
         return;
     }
 
-    const requestId = `${username}-${Date.now()}`;
-    if (pendingRequests.has(requestId)) return;
-    pendingRequests.add(requestId);
-
-    const history = userConversations.get(username) || [];
-    userConversations.set(username, history);
+    // Deduplicate in-flight requests per user
+    if (pendingRequests.has(username)) {
+        console.log(`[Pending] Ignoring duplicate request from ${username}`);
+        return;
+    }
+    pendingRequests.add(username);
 
     try {
-        await processRequest(username, prompt, isWhisper, requestId, history, hoverStats);
+        await processRequest(username, prompt, isWhisper, hoverStats);
     } catch (err) {
         console.error(`[Error] Request from ${username} failed:`, err);
         safeChat(`/msg ${username} Request failed. Please try again.`);
     } finally {
-        setTimeout(() => pendingRequests.delete(requestId), 10000);
+        pendingRequests.delete(username);
     }
 }
 
-async function processRequest(username, prompt, isWhisper, requestId, history, hoverStats = null) {
+async function processRequest(username, prompt, isWhisper, hoverStats) {
     const isExempt = username.toLowerCase() === 'freddison';
 
     if (!isExempt) {
@@ -433,48 +400,66 @@ async function processRequest(username, prompt, isWhisper, requestId, history, h
         userCooldowns.set(username, timestamps);
     }
 
-    history.push({ role: "user", content: prompt });
+    // Clone history so mutations don't corrupt state on failure
+    const history        = userConversations.get(username) || [];
+    const workingHistory = [...history, { role: 'user', content: prompt }];
 
-    const delay = Math.max(0, (lastApiCall + 5000) - Date.now());
+    // Enforce minimum gap between API calls
+    const delay = Math.max(0, (lastApiCall + API_GAP_MS) - Date.now());
     if (delay > 0) await sleep(delay);
     lastApiCall = Date.now();
 
     console.log(`[Request] ${username}: ${prompt.substring(0, 100)}`);
 
-    // --- First pass: no news context ---
-    const firstResponse = await callGemini(username, history, hoverStats, null);
+    // ── First pass: no news context ────────────────────────────────
+    const firstResponse = await callGemini(username, workingHistory, hoverStats, null);
     if (!firstResponse) return;
 
-    // --- Check if Gemini wants DPS news ---
+    console.log(`[Debug] firstResponse for ${username}: "${firstResponse}"`);
+
+    // ── DPS news flow ──────────────────────────────────────────────
     if (isGatheringData(firstResponse)) {
         console.log(`[News] ${username} triggered DPS news lookup`);
-
-        // Notify the user immediately
         safeChat(`/msg ${username} Gathering Data...`);
 
-        // Load the news file
         const newsContent = loadDpsNews();
         if (!newsContent) {
             safeChat(`/msg ${username} Could not load DPS news data. Try again later.`);
             return;
         }
 
-        // Second pass: resend with news context injected
+        // Enforce gap before second call
+        const gap = Math.max(0, (lastApiCall + API_GAP_MS) - Date.now());
+        if (gap > 0) await sleep(gap);
         lastApiCall = Date.now();
-        const secondResponse = await callGemini(username, history, hoverStats, newsContent);
-        if (secondResponse) {
-            // Make sure the second response isn't also Gathering Data (safety guard)
-            if (isGatheringData(secondResponse)) {
-                safeChat(`/msg ${username} Something went wrong fetching DPS news. Try again.`);
-            } else {
-                sendSmartChat(secondResponse, username, isWhisper);
-            }
+
+        const secondResponse = await callGemini(username, workingHistory, hoverStats, newsContent);
+        if (!secondResponse) return;
+
+        if (isGatheringData(secondResponse)) {
+            safeChat(`/msg ${username} Something went wrong fetching DPS news. Try again.`);
+            return;
         }
+
+        // Commit to history only on success
+        commitHistory(username, prompt, secondResponse);
+        sendSmartChat(secondResponse, username, isWhisper);
         return;
     }
 
-    // --- Normal response ---
+    // ── Normal response ────────────────────────────────────────────
+    commitHistory(username, prompt, firstResponse);
     sendSmartChat(firstResponse, username, isWhisper);
+}
+
+/** Persist the exchange to conversation history, trimmed to last 4 turns. */
+function commitHistory(username, userPrompt, assistantReply) {
+    const history = userConversations.get(username) || [];
+    history.push({ role: 'user', content: userPrompt });
+    history.push({ role: 'assistant', content: assistantReply });
+    // Keep only the last 4 messages (2 exchanges)
+    if (history.length > 4) history.splice(0, history.length - 4);
+    userConversations.set(username, history);
 }
 
 // -------------------------------------------------------------------
@@ -485,31 +470,23 @@ async function callGemini(username, history, hoverStats = null, newsContext = nu
         const systemPrompt = buildSystemPrompt(username, hoverStats, newsContext);
 
         const conversationText = history
-            .map(m => `${m.role === "user" ? "User" : "Bot"}: ${m.content}`)
-            .join("\n");
+            .map(m => `${m.role === 'user' ? 'User' : 'Bot'}: ${m.content}`)
+            .join('\n');
 
         const fullUserPrompt = `Conversation so far:\n${conversationText}\n\nRespond to the latest user message.`;
 
         const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
+            model: 'gemini-2.5-flash',
             contents: fullUserPrompt,
             config: {
                 systemInstruction: systemPrompt,
                 thinkingConfig: { thinkingLevel: ThinkingLevel.NONE },
-            }
+            },
         });
 
         if (!response?.text) throw new Error('Empty response from API');
 
         const responseText = response.text.trim();
-
-        // Only store assistant reply in history if it's a real response (not Gathering Data)
-        if (!isGatheringData(responseText)) {
-            history.push({ role: "assistant", content: responseText });
-            if (history.length > 4) history.splice(0, history.length - 4);
-            userConversations.set(username, history);
-        }
-
         console.log(`[Response] ${responseText.length} chars`);
         return responseText;
 
@@ -528,10 +505,12 @@ async function callGemini(username, history, hoverStats = null, newsContext = nu
         if (err.message?.includes('RECITATION')) {
             safeChat(`/msg ${username} Response blocked (recitation). Rephrase?`); return null;
         }
+
         if (attempt < MAX_RETRIES) {
             await sleep(RETRY_DELAY * attempt);
             return callGemini(username, history, hoverStats, newsContext, attempt + 1);
         }
+
         safeChat(`/msg ${username} API error after ${MAX_RETRIES} attempts. Try again later.`);
         return null;
     }
@@ -540,13 +519,25 @@ async function callGemini(username, history, hoverStats = null, newsContext = nu
 // -------------------------------------------------------------------
 // CHAT OUTPUT
 // -------------------------------------------------------------------
-function sendSmartChat(text, targetUser) {
+
+/**
+ * @param {string}  text
+ * @param {string}  targetUser
+ * @param {boolean} isWhisper  — kept for future use; always /msg for now
+ */
+function sendSmartChat(text, targetUser, isWhisper) {
     if (!text) return;
     try {
-        const cleanText = text.replace(/\n+/g, ' ').replace(/\s+/g, ' ').replace(/[*_`#]/g, '').trim();
+        const cleanText = text
+            .replace(/\n+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .replace(/[*_`#]/g, '')
+            .trim();
         if (!cleanText) return;
+
         const prefix = `/msg ${targetUser} `;
-        const limit = 256 - prefix.length - 10;
+        const limit  = 256 - prefix.length - 10;
+
         if (cleanText.length <= limit) {
             safeChat(`${prefix}${cleanText}`);
         } else {
@@ -559,9 +550,10 @@ function sendSmartChat(text, targetUser) {
 }
 
 function splitIntoChunks(text, maxLength) {
-    const chunks = [];
-    let current = '';
+    const chunks   = [];
+    let current    = '';
     const sentences = text.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [text];
+
     for (const sentence of sentences) {
         if ((current + sentence).length <= maxLength) {
             current += sentence;
@@ -590,7 +582,7 @@ function splitIntoChunks(text, maxLength) {
 function safeChat(message) {
     try {
         if (bot?.chat) bot.chat(message);
-        else console.error('[Error] Bot not ready');
+        else console.error('[Error] Bot not ready to chat');
     } catch (err) {
         console.error('[Error] safeChat:', err);
     }
@@ -598,9 +590,13 @@ function safeChat(message) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// -------------------------------------------------------------------
+// PROCESS GUARDS
+// -------------------------------------------------------------------
 process.on('SIGINT', () => { if (bot) bot.quit(); process.exit(0); });
-process.on('uncaughtException', err => console.error('[Fatal] Uncaught:', err));
-process.on('unhandledRejection', (r, p) => console.error('[Fatal] Rejection:', p, r));
+process.on('uncaughtException',  err          => console.error('[Fatal] Uncaught:', err));
+process.on('unhandledRejection', (reason, p)  => console.error('[Fatal] Rejection:', p, reason));
 
+// -------------------------------------------------------------------
 console.log('[Bot] Starting...');
 createBot();
