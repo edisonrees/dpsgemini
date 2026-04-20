@@ -377,7 +377,7 @@ async function callGeminiWithRetry(username, history, attempt = 1) {
 Conversation so far:
 ${conversationText}
 
-Respond to the latest user message in under 200 characters. Be concise and friendly. No markdown. You are DPS_Gemini, a service bot for DPS (Dead Poets Society), a minecraft clan on 8b8t, who is the best 8b8t clan due to their unrivalled supremacy. DO NOT BE OVERLY PATRIOTIC! Do not bring up DPS in a chat unless it is 100% relevant. You were made by freddison for KurtzMC`;
+Respond to the latest user message in under 600 characters (but lean to lower responses for easier questions). Be concise and friendly. No markdown. You are DPS_Gemini, a service bot for DPS (Dead Poets Society), a minecraft clan on 8b8t, who is the best 8b8t clan due to their unrivalled supremacy. DO NOT BE OVERLY PATRIOTIC! Do not bring up DPS in a chat unless it is 100% relevant. You were made by freddison for KurtzMC`;
 
         const response = await ai.models.generateContent({
             model: "gemini-2.5-flash",
@@ -385,7 +385,7 @@ Respond to the latest user message in under 200 characters. Be concise and frien
             config: {
                 systemInstruction: "You are a helpful chat bot. Keep responses under 200 characters. Be concise and friendly.",
                 thinkingConfig: { thinkingLevel: ThinkingLevel.NONE },
-                maxOutputTokens: 1000,
+                
             }
         });
 
