@@ -231,16 +231,17 @@ function setupBotEvents() {
             // --- Whisper check first ---
             const whisper = parseWhisperPacket(data);
             if (whisper) {
-                const { realUsername, message } = whisper;
-                if (realUsername === bot.username) return;
-                console.log(`[Whisper] ${realUsername}: ${message}`);
-                handleGeminiRequest(realUsername, message, true);
-                return;
-            }
+                const { realUsername, plainText } = parsed;
 
-            // --- Public chat ---
-            const parsed = parsePacket(data);
-            if (!parsed) return;
+if (realUsername === bot.username) return;
+
+// 🔥 Remove "<username>" prefix BEFORE anything else
+let cleanText = plainText.replace(/^<[^>]+>\s*/, '');
+
+// Only act if the message contains a trigger word
+if (!hasTrigger(cleanText)) return;
+
+const prompt = stripTrigger(cleanText);
 
             const { realUsername, plainText } = parsed;
             if (realUsername === bot.username) return;
