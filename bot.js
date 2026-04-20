@@ -49,7 +49,7 @@ const RETRY_DELAY = 2000;
 let bot;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
-const RECONNECT_DELAY = 5000;
+const RECONNECT_DELAY = 15000;
 
 // --- BOT INITIALIZATION ---
 function createBot() {
