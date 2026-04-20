@@ -1,0 +1,12 @@
+{
+  "name": "mineflayer-gemini-bot",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "mineflayer": "^4.0.0",
+    "@google/genai": "^0.5.0"
+  }
+}
