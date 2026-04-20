@@ -253,7 +253,9 @@ function setupBotEvents() {
         if (realUsername === bot.username) return;
 
         // Remove "<username>" prefix if it exists
-        let cleanText = plainText.replace(/^<[^>]+>\s*/, '');
+        let cleanText = plainText
+    .replace(/^\[[^\]]+\]\s*/g, '')   // remove [Ultra]
+    .replace(/^<[^>]+>\s*/g, '');     // remove <b>
 
         // Trigger check
         if (!hasTrigger(cleanText)) return;
