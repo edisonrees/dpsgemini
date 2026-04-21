@@ -33,12 +33,66 @@ const MSG_LIMIT   = 5;
 const TIME_WINDOW = 2 * 60 * 1000;   // 2 minutes
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 2000;
-const API_GAP_MS  = 5000;            // minimum ms between Gemini calls
+const API_GAP_MS  = 5000;
 let lastApiCall   = 0;
 
-// Track which usernames were already handled by the packet handler
-// so the native `whisper` event doesn't double-fire.
+// Memory limits — critical for Railway free tier
+const MAX_USERS_TRACKED   = 150;
+const MAX_PENDING_TRACKED = 50;
+
 const handledByPacket = new Set();
+
+// -------------------------------------------------------------------
+// MEMORY WATCHDOG — restarts gracefully before OOM kills the process
+// -------------------------------------------------------------------
+const MEMORY_CHECK_INTERVAL = 60 * 1000;        // every 60s
+const MEMORY_LIMIT_MB       = 400;              // restart below OS kill threshold
+
+setInterval(() => {
+    const used = process.memoryUsage().heapUsed / 1024 / 1024;
+    console.log(`[Memory] Heap used: ${used.toFixed(1)} MB`);
+    if (used > MEMORY_LIMIT_MB) {
+        console.error(`[Memory] Heap > ${MEMORY_LIMIT_MB}MB — performing clean restart`);
+        gracefulRestart();
+    }
+}, MEMORY_CHECK_INTERVAL);
+
+function gracefulRestart() {
+    // Clear all in-memory state before restarting the bot
+    userCooldowns.clear();
+    userConversations.clear();
+    pendingRequests.clear();
+    handledByPacket.clear();
+    scheduleReconnect('memory-pressure');
+}
+
+// -------------------------------------------------------------------
+// PERIODIC CLEANUP — prevents slow map growth over hours/days
+// -------------------------------------------------------------------
+setInterval(() => {
+    const now = Date.now();
+
+    // Remove stale cooldown entries
+    for (const [user, timestamps] of userCooldowns.entries()) {
+        const fresh = timestamps.filter(ts => now - ts < TIME_WINDOW);
+        if (fresh.length === 0) userCooldowns.delete(user);
+        else userCooldowns.set(user, fresh);
+    }
+
+    // Evict oldest conversation entries if over cap
+    while (userConversations.size > MAX_USERS_TRACKED) {
+        const oldest = userConversations.keys().next().value;
+        userConversations.delete(oldest);
+    }
+
+    // Clear any stale pending requests (shouldn't linger, but safety net)
+    if (pendingRequests.size > MAX_PENDING_TRACKED) {
+        pendingRequests.clear();
+        console.warn('[Cleanup] pendingRequests exceeded cap, cleared');
+    }
+
+    console.log(`[Cleanup] cooldowns:${userCooldowns.size} conversations:${userConversations.size} pending:${pendingRequests.size}`);
+}, 5 * 60 * 1000); // every 5 minutes
 
 // -------------------------------------------------------------------
 // APPROVED PLAYERS
@@ -73,17 +127,13 @@ function loadDpsNews() {
 }
 
 const GATHERING_DATA_REGEX = /^\s*Gathering Data\.{3}\s*$/i;
-
-function isGatheringData(text) {
-    return GATHERING_DATA_REGEX.test(text);
-}
+function isGatheringData(text) { return GATHERING_DATA_REGEX.test(text); }
 
 // -------------------------------------------------------------------
 // TRIGGER DETECTION
 // -------------------------------------------------------------------
 const TRIGGER_REGEX = /(?:^|>)\s*!g(?:emini)?,?\b/i;
-
-function hasTrigger(text)  { return TRIGGER_REGEX.test(text); }
+function hasTrigger(text)   { return TRIGGER_REGEX.test(text); }
 function stripTrigger(text) { return text.replace(/(?:^|>)\s*!g(?:emini)?,?\s*/gi, '').trim(); }
 
 // -------------------------------------------------------------------
@@ -120,10 +170,10 @@ function findHoverStats(component) {
         const contents = component.hoverEvent.contents;
         if (contents) {
             const text       = componentToPlainText(contents);
-            const lang       = text.match(/Lang:\s*(\S+)/i)?.[1]             ?? null;
+            const lang       = text.match(/Lang:\s*(\S+)/i)?.[1]              ?? null;
             const timePlayed = text.match(/Time Played:\s*([\d.]+ \w+)/i)?.[1] ?? null;
-            const kills      = text.match(/Player Kills:\s*(\d+)/i)?.[1]     ?? null;
-            const deaths     = text.match(/Player Deaths:\s*(\d+)/i)?.[1]    ?? null;
+            const kills      = text.match(/Player Kills:\s*(\d+)/i)?.[1]      ?? null;
+            const deaths     = text.match(/Player Deaths:\s*(\d+)/i)?.[1]     ?? null;
             if (lang || timePlayed || kills || deaths) return { lang, timePlayed, kills, deaths };
         }
     }
@@ -208,7 +258,7 @@ function createBot() {
 function setupBotEvents() {
     bot.once('spawn', () => {
         console.log('[Bot] Spawned, waiting for chat readiness...');
-        reconnectAttempts = 0; // reset on successful spawn
+        reconnectAttempts = 0;
         const tryLogin = () => {
             if (bot?.chat) {
                 try {
@@ -225,18 +275,19 @@ function setupBotEvents() {
         setTimeout(tryLogin, 5000);
     });
 
-    bot._client.on('packet', (data, meta) => {
+    // KEY FIX: store the handler reference so it can be explicitly removed
+    // on reconnect, preventing listener accumulation across sessions.
+    const packetHandler = (data, meta) => {
         try {
             const chatPackets = ['chat', 'player_chat', 'system_chat', 'profileless_chat'];
             if (!chatPackets.includes(meta.name)) return;
 
-            // ── WHISPER FLOW ──────────────────────────────────────────
+            // ── WHISPER FLOW ─────────────────────────────────────────
             const whisper = parseWhisperPacket(data);
             if (whisper) {
                 const { realUsername, message } = whisper;
                 if (realUsername === bot.username) return;
                 console.log(`[Whisper/packet] ${realUsername}: ${message}`);
-                // Mark so the native whisper event doesn't double-fire
                 handledByPacket.add(realUsername);
                 setTimeout(() => handledByPacket.delete(realUsername), 2000);
                 handleGeminiRequest(realUsername, message, true);
@@ -268,12 +319,17 @@ function setupBotEvents() {
         } catch (err) {
             console.error('[Error] Packet handler:', err);
         }
-    });
+    };
+
+    bot._client.on('packet', packetHandler);
+
+    // Store reference on bot so scheduleReconnect can clean it up
+    bot._packetHandler = packetHandler;
 
     // Native whisper fallback — only fires if packet handler missed it
     bot.on('whisper', (username, message) => {
         try {
-            if (handledByPacket.has(username)) return; // already handled above
+            if (handledByPacket.has(username)) return;
             console.log(`[Whisper/native] ${username}: ${message}`);
             handleGeminiRequest(username, message, true);
         } catch (err) {
@@ -283,8 +339,8 @@ function setupBotEvents() {
 
     bot.on('login',  ()       => console.log('[Bot] Logged in'));
     bot.on('error',  (err)    => console.error('[Bot Error]', err.message || err));
-    bot.on('kicked', (reason) => { console.log('[Kicked]', reason);        scheduleReconnect('kicked'); });
-    bot.on('end',    (reason) => { console.log('[Disconnected]', reason);  scheduleReconnect('disconnected'); });
+    bot.on('kicked', (reason) => { console.log('[Kicked]', reason);       scheduleReconnect('kicked'); });
+    bot.on('end',    (reason) => { console.log('[Disconnected]', reason); scheduleReconnect('disconnected'); });
 }
 
 function scheduleReconnect(reason = 'unknown') {
@@ -300,14 +356,23 @@ function scheduleReconnect(reason = 'unknown') {
     reconnectAttempts++;
     const delay = Math.min(300000, RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts));
     console.log(`[Reconnect] Attempt ${reconnectAttempts} in ${Math.round(delay / 1000)}s (${reason})`);
+
     setTimeout(() => {
         reconnecting = false;
         try {
             if (bot) {
+                // KEY FIX: explicitly remove the stored packet handler before
+                // destroying the client, so no ghost listeners survive on the
+                // underlying socket/emitter across reconnects.
+                if (bot._client && bot._packetHandler) {
+                    bot._client.removeListener('packet', bot._packetHandler);
+                }
+                bot._packetHandler = null;
                 bot.removeAllListeners();
-                bot.quit();
+                try { bot.quit(); } catch {}
             }
         } catch {}
+        bot = null; // KEY FIX: null out so GC can reclaim the old bot object
         createBot();
     }, delay);
 }
@@ -355,7 +420,7 @@ You must NEVER respond with "Gathering Data..." for any reason other than genuin
 // -------------------------------------------------------------------
 async function handleGeminiRequest(username, message, isWhisper, hoverStats = null) {
     if (!username || !message) return;
-    if (username === bot.username) return;
+    if (username === bot?.username) return;
 
     if (!approvedPlayers.has(username.toLowerCase())) {
         console.log(`[Blocked] ${username} is not an approved player`);
@@ -368,7 +433,6 @@ async function handleGeminiRequest(username, message, isWhisper, hoverStats = nu
         return;
     }
 
-    // Deduplicate in-flight requests per user
     if (pendingRequests.has(username)) {
         console.log(`[Pending] Ignoring duplicate request from ${username}`);
         return;
@@ -400,11 +464,9 @@ async function processRequest(username, prompt, isWhisper, hoverStats) {
         userCooldowns.set(username, timestamps);
     }
 
-    // Clone history so mutations don't corrupt state on failure
     const history        = userConversations.get(username) || [];
     const workingHistory = [...history, { role: 'user', content: prompt }];
 
-    // Enforce minimum gap between API calls
     const delay = Math.max(0, (lastApiCall + API_GAP_MS) - Date.now());
     if (delay > 0) await sleep(delay);
     lastApiCall = Date.now();
@@ -428,7 +490,6 @@ async function processRequest(username, prompt, isWhisper, hoverStats) {
             return;
         }
 
-        // Enforce gap before second call
         const gap = Math.max(0, (lastApiCall + API_GAP_MS) - Date.now());
         if (gap > 0) await sleep(gap);
         lastApiCall = Date.now();
@@ -441,7 +502,6 @@ async function processRequest(username, prompt, isWhisper, hoverStats) {
             return;
         }
 
-        // Commit to history only on success
         commitHistory(username, prompt, secondResponse);
         sendSmartChat(secondResponse, username, isWhisper);
         return;
@@ -452,12 +512,16 @@ async function processRequest(username, prompt, isWhisper, hoverStats) {
     sendSmartChat(firstResponse, username, isWhisper);
 }
 
-/** Persist the exchange to conversation history, trimmed to last 4 turns. */
 function commitHistory(username, userPrompt, assistantReply) {
+    // KEY FIX: evict oldest user if we're at the cap before adding a new one
+    if (userConversations.size >= MAX_USERS_TRACKED && !userConversations.has(username)) {
+        const oldest = userConversations.keys().next().value;
+        userConversations.delete(oldest);
+    }
+
     const history = userConversations.get(username) || [];
     history.push({ role: 'user', content: userPrompt });
     history.push({ role: 'assistant', content: assistantReply });
-    // Keep only the last 4 messages (2 exchanges)
     if (history.length > 4) history.splice(0, history.length - 4);
     userConversations.set(username, history);
 }
@@ -519,12 +583,6 @@ async function callGemini(username, history, hoverStats = null, newsContext = nu
 // -------------------------------------------------------------------
 // CHAT OUTPUT
 // -------------------------------------------------------------------
-
-/**
- * @param {string}  text
- * @param {string}  targetUser
- * @param {boolean} isWhisper  — kept for future use; always /msg for now
- */
 function sendSmartChat(text, targetUser, isWhisper) {
     if (!text) return;
     try {
@@ -550,8 +608,8 @@ function sendSmartChat(text, targetUser, isWhisper) {
 }
 
 function splitIntoChunks(text, maxLength) {
-    const chunks   = [];
-    let current    = '';
+    const chunks    = [];
+    let current     = '';
     const sentences = text.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [text];
 
     for (const sentence of sentences) {
@@ -593,9 +651,9 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 // -------------------------------------------------------------------
 // PROCESS GUARDS
 // -------------------------------------------------------------------
-process.on('SIGINT', () => { if (bot) bot.quit(); process.exit(0); });
-process.on('uncaughtException',  err          => console.error('[Fatal] Uncaught:', err));
-process.on('unhandledRejection', (reason, p)  => console.error('[Fatal] Rejection:', p, reason));
+process.on('SIGINT',             ()            => { if (bot) bot.quit(); process.exit(0); });
+process.on('uncaughtException',  err           => console.error('[Fatal] Uncaught:', err));
+process.on('unhandledRejection', (reason, p)   => console.error('[Fatal] Rejection:', p, reason));
 
 // -------------------------------------------------------------------
 console.log('[Bot] Starting...');
