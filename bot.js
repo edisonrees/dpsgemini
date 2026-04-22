@@ -42,6 +42,34 @@ const MAX_PENDING_TRACKED = 50;
 
 const handledByPacket = new Set();
 
+// --- /8b8t INTERVAL ---
+let eightb8tInterval = null;
+
+function start8b8tLoop() {
+    if (eightb8tInterval) {
+        clearInterval(eightb8tInterval);
+    }
+    eightb8tInterval = setInterval(() => {
+        try {
+            if (bot?.chat) {
+                bot.chat('/8b8t');
+                console.log('[8b8t] Sent /8b8t command');
+            }
+        } catch (err) {
+            console.error('[8b8t] Failed to send /8b8t:', err.message);
+        }
+    }, 2 * 60 * 1000); // every 2 minutes
+    console.log('[8b8t] Loop started');
+}
+
+function stop8b8tLoop() {
+    if (eightb8tInterval) {
+        clearInterval(eightb8tInterval);
+        eightb8tInterval = null;
+        console.log('[8b8t] Loop stopped');
+    }
+}
+
 // -------------------------------------------------------------------
 // MEMORY WATCHDOG — restarts gracefully before OOM kills the process
 // -------------------------------------------------------------------
@@ -58,11 +86,11 @@ setInterval(() => {
 }, MEMORY_CHECK_INTERVAL);
 
 function gracefulRestart() {
-    // Clear all in-memory state before restarting the bot
     userCooldowns.clear();
     userConversations.clear();
     pendingRequests.clear();
     handledByPacket.clear();
+    stop8b8tLoop();
     scheduleReconnect('memory-pressure');
 }
 
@@ -72,27 +100,24 @@ function gracefulRestart() {
 setInterval(() => {
     const now = Date.now();
 
-    // Remove stale cooldown entries
     for (const [user, timestamps] of userCooldowns.entries()) {
         const fresh = timestamps.filter(ts => now - ts < TIME_WINDOW);
         if (fresh.length === 0) userCooldowns.delete(user);
         else userCooldowns.set(user, fresh);
     }
 
-    // Evict oldest conversation entries if over cap
     while (userConversations.size > MAX_USERS_TRACKED) {
         const oldest = userConversations.keys().next().value;
         userConversations.delete(oldest);
     }
 
-    // Clear any stale pending requests (shouldn't linger, but safety net)
     if (pendingRequests.size > MAX_PENDING_TRACKED) {
         pendingRequests.clear();
         console.warn('[Cleanup] pendingRequests exceeded cap, cleared');
     }
 
     console.log(`[Cleanup] cooldowns:${userCooldowns.size} conversations:${userConversations.size} pending:${pendingRequests.size}`);
-}, 5 * 60 * 1000); // every 5 minutes
+}, 5 * 60 * 1000);
 
 // -------------------------------------------------------------------
 // APPROVED PLAYERS
@@ -259,11 +284,17 @@ function setupBotEvents() {
     bot.once('spawn', () => {
         console.log('[Bot] Spawned, waiting for chat readiness...');
         reconnectAttempts = 0;
+
         const tryLogin = () => {
             if (bot?.chat) {
                 try {
                     bot.chat(`/login ${PASSWORD}`);
                     console.log('[Bot] Login command sent');
+
+                    // Start the /8b8t loop after login, with a short delay
+                    // to let the server process the login first
+                    setTimeout(() => start8b8tLoop(), 10000);
+
                 } catch (err) {
                     console.error('[Error] Login failed, retrying...', err.message);
                     setTimeout(tryLogin, 3000);
@@ -275,8 +306,6 @@ function setupBotEvents() {
         setTimeout(tryLogin, 5000);
     });
 
-    // KEY FIX: store the handler reference so it can be explicitly removed
-    // on reconnect, preventing listener accumulation across sessions.
     const packetHandler = (data, meta) => {
         try {
             const chatPackets = ['chat', 'player_chat', 'system_chat', 'profileless_chat'];
@@ -322,11 +351,8 @@ function setupBotEvents() {
     };
 
     bot._client.on('packet', packetHandler);
-
-    // Store reference on bot so scheduleReconnect can clean it up
     bot._packetHandler = packetHandler;
 
-    // Native whisper fallback — only fires if packet handler missed it
     bot.on('whisper', (username, message) => {
         try {
             if (handledByPacket.has(username)) return;
@@ -339,8 +365,8 @@ function setupBotEvents() {
 
     bot.on('login',  ()       => console.log('[Bot] Logged in'));
     bot.on('error',  (err)    => console.error('[Bot Error]', err.message || err));
-    bot.on('kicked', (reason) => { console.log('[Kicked]', reason);       scheduleReconnect('kicked'); });
-    bot.on('end',    (reason) => { console.log('[Disconnected]', reason); scheduleReconnect('disconnected'); });
+    bot.on('kicked', (reason) => { console.log('[Kicked]', reason);       stop8b8tLoop(); scheduleReconnect('kicked'); });
+    bot.on('end',    (reason) => { console.log('[Disconnected]', reason); stop8b8tLoop(); scheduleReconnect('disconnected'); });
 }
 
 function scheduleReconnect(reason = 'unknown') {
@@ -361,9 +387,6 @@ function scheduleReconnect(reason = 'unknown') {
         reconnecting = false;
         try {
             if (bot) {
-                // KEY FIX: explicitly remove the stored packet handler before
-                // destroying the client, so no ghost listeners survive on the
-                // underlying socket/emitter across reconnects.
                 if (bot._client && bot._packetHandler) {
                     bot._client.removeListener('packet', bot._packetHandler);
                 }
@@ -372,7 +395,7 @@ function scheduleReconnect(reason = 'unknown') {
                 try { bot.quit(); } catch {}
             }
         } catch {}
-        bot = null; // KEY FIX: null out so GC can reclaim the old bot object
+        bot = null;
         createBot();
     }, delay);
 }
@@ -513,7 +536,6 @@ async function processRequest(username, prompt, isWhisper, hoverStats) {
 }
 
 function commitHistory(username, userPrompt, assistantReply) {
-    // KEY FIX: evict oldest user if we're at the cap before adding a new one
     if (userConversations.size >= MAX_USERS_TRACKED && !userConversations.has(username)) {
         const oldest = userConversations.keys().next().value;
         userConversations.delete(oldest);
@@ -651,7 +673,7 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 // -------------------------------------------------------------------
 // PROCESS GUARDS
 // -------------------------------------------------------------------
-process.on('SIGINT',             ()            => { if (bot) bot.quit(); process.exit(0); });
+process.on('SIGINT',             ()            => { stop8b8tLoop(); if (bot) bot.quit(); process.exit(0); });
 process.on('uncaughtException',  err           => console.error('[Fatal] Uncaught:', err));
 process.on('unhandledRejection', (reason, p)   => console.error('[Fatal] Rejection:', p, reason));
 
