@@ -930,7 +930,22 @@ async function dispatchResponse(rawResponse, senderUsername, isWhisper, role = '
         consumeTempWhitelistUse(senderUsername);
         return;
     }
+// ── MULTITALK command (available to all roles) ────────────────
+const multiCmd = parseMultiTalkCommand(text);
+if (multiCmd) {
+    console.log(`[MULTITALK] ${senderUsername} -> ${multiCmd.targets.join(', ')}: ${multiCmd.message}`);
 
+    const items = multiCmd.targets.map(t => ({
+        target: t,
+        message: multiCmd.message
+    }));
+
+    enqueueWhispers(items);
+
+    safeChat(`/msg ${senderUsername} Done — messaged ${multiCmd.targets.length} players.`);
+    consumeTempWhitelistUse(senderUsername);
+    return;
+}
     // ── WHITETEMP command (DPS only) ──────────────────────────────
     const wtCmd = parseWhiteTempCommand(text);
     if (wtCmd) {
