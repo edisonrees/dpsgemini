@@ -31,6 +31,14 @@ const tempWhitelist = new Map();
 // Map of username (lowercase) -> expiry timestamp (ms). Infinity = permanent ban.
 const tempBans = new Map();
 
+// Set of currently online player usernames (exact case from server)
+const onlinePlayers = new Set();
+
+// Whisper queue: Array of { target, message }. Drained at WHISPER_QUEUE_GAP_MS intervals.
+const whisperQueue  = [];
+let whisperQueueDraining = false;
+const WHISPER_QUEUE_GAP_MS = 1200; // ms between queued whispers to avoid server rate-limits
+
 const userCooldowns     = new Map();
 const userConversations = new Map();
 const pendingRequests   = new Set();
@@ -131,6 +139,50 @@ function parseBanCommand(text) {
 }
 
 // -------------------------------------------------------------------
+// WHISPER QUEUE
+// -------------------------------------------------------------------
+
+/**
+ * Enqueue a batch of whispers. Each item: { target, message }
+ * Drains automatically with WHISPER_QUEUE_GAP_MS spacing.
+ */
+function enqueueWhispers(items) {
+    for (const item of items) whisperQueue.push(item);
+    if (!whisperQueueDraining) drainWhisperQueue();
+}
+
+function drainWhisperQueue() {
+    if (whisperQueue.length === 0) { whisperQueueDraining = false; return; }
+    whisperQueueDraining = true;
+    const { target, message } = whisperQueue.shift();
+    safeChat(`/msg ${target} ${message}`);
+    setTimeout(drainWhisperQueue, WHISPER_QUEUE_GAP_MS);
+}
+
+// -------------------------------------------------------------------
+// ONLINE PLAYER HELPERS
+// -------------------------------------------------------------------
+
+/** Returns the set of all currently online usernames (exact case). */
+function getOnlinePlayers() {
+    return new Set(onlinePlayers);
+}
+
+/** Returns online players who are in approvedPlayers (DPS members). */
+function getOnlineDpsPlayers() {
+    return [...onlinePlayers].filter(name => approvedPlayers.has(name.toLowerCase()));
+}
+
+/** Returns online players who are in tempWhitelist. */
+function getOnlineTempPlayers() {
+    return [...onlinePlayers].filter(name => {
+        const key   = name.toLowerCase();
+        const entry = tempWhitelist.get(key);
+        return entry && (entry.remaining === Infinity || entry.remaining > 0);
+    });
+}
+
+// -------------------------------------------------------------------
 // USER ROLE HELPER
 // -------------------------------------------------------------------
 // Returns 'dps' | 'temp' | 'none'
@@ -194,6 +246,9 @@ function gracefulRestart() {
     handledByPacket.clear();
     tempWhitelist.clear();
     tempBans.clear();
+    onlinePlayers.clear();
+    whisperQueue.length = 0;
+    whisperQueueDraining = false;
     stop8b8tLoop();
     scheduleReconnect('memory-pressure');
 }
@@ -342,6 +397,19 @@ function containsAdminCommand(text) {
     return WHITETEMP_REGEX.test(text) || REVOKE_REGEX.test(text);
 }
 
+// {MULTITALK}{username1,username2,...}{message}
+// Gemini uses this to whisper multiple players at once.
+const MULTITALK_REGEX = /\{MULTITALK\}\{([^}]+)\}\{([^}]+)\}/;
+
+function parseMultiTalkCommand(text) {
+    const match = text.match(MULTITALK_REGEX);
+    if (!match) return null;
+    const targets = match[1].split(',').map(t => t.trim()).filter(Boolean);
+    const message = match[2].trim();
+    if (!targets.length || !message) return null;
+    return { targets, message };
+}
+
 // -------------------------------------------------------------------
 // TRIGGER DETECTION
 // -------------------------------------------------------------------
@@ -473,6 +541,13 @@ function setupBotEvents() {
         console.log('[Bot] Spawned, waiting for chat readiness...');
         reconnectAttempts = 0;
 
+        // Seed the online player list from whoever is already visible
+        onlinePlayers.clear();
+        for (const username of Object.keys(bot.players || {})) {
+            if (username !== bot.username) onlinePlayers.add(username);
+        }
+        console.log(`[Players] Seeded ${onlinePlayers.size} online players`);
+
         const tryLogin = () => {
             if (bot?.chat) {
                 try {
@@ -550,7 +625,21 @@ function setupBotEvents() {
     bot.on('login',  ()       => console.log('[Bot] Logged in'));
     bot.on('error',  (err)    => console.error('[Bot Error]', err.message || err));
     bot.on('kicked', (reason) => { console.log('[Kicked]', reason);       stop8b8tLoop(); scheduleReconnect('kicked'); });
-    bot.on('end',    (reason) => { console.log('[Disconnected]', reason); stop8b8tLoop(); scheduleReconnect('disconnected'); });
+    bot.on('end',    (reason) => { console.log('[Disconnected]', reason); stop8b8tLoop(); onlinePlayers.clear(); scheduleReconnect('disconnected'); });
+
+    bot.on('playerJoined', (player) => {
+        if (player.username && player.username !== bot.username) {
+            onlinePlayers.add(player.username);
+            console.log(`[Players] ${player.username} joined — online: ${onlinePlayers.size}`);
+        }
+    });
+
+    bot.on('playerLeft', (player) => {
+        if (player.username) {
+            onlinePlayers.delete(player.username);
+            console.log(`[Players] ${player.username} left — online: ${onlinePlayers.size}`);
+        }
+    });
 }
 
 function scheduleReconnect(reason = 'unknown') {
