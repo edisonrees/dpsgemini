@@ -681,6 +681,9 @@ function buildSystemPrompt(username, hoverStats, newsContext = null, userRole = 
     const timePlayed = hoverStats?.timePlayed  ?? null;
     const kills      = hoverStats?.kills       ?? null;
     const deaths     = hoverStats?.deaths      ?? null;
+    const onlineList = [...onlinePlayers].join(', ') || 'none';
+    const dpsOnline  = getOnlineDpsPlayers().join(', ') || 'none';
+    const tempOnline = getOnlineTempPlayers().join(', ') || 'none';
 
     let statsBlock = '';
     if (timePlayed || kills || deaths) {
@@ -741,6 +744,14 @@ The following commands are available to DPS members ONLY. Never execute them for
 4. REVOKE TEMP ACCESS
    {REVOKE}{username}
    Removes a player from the temporary whitelist immediately.
+5. MULTI WHISPER
+   {MULTITALK}{user1,user2,...}{message}
+   Sends the same whisper to multiple players.
+
+--- SERVER CONTEXT ---
+Currently online players: ${onlineList}
+Online DPS members: ${dpsOnline}
+Online temporary users: ${tempOnline}
 
 After any command executes, the bot will confirm to the requesting user automatically. You don't need to mention it.`;
 
