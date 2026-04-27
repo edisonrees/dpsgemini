@@ -1312,9 +1312,17 @@ function containsAdminCommand(text) {
 // SECTION 20 — TRIGGER DETECTION
 // ===================================================================
 
-const TRIGGER_REGEX = /(?:^|>)\s*!g(?:emini)?,?\b/i;
+function hasTrigger(text, username) {
+    const lower = username.toLowerCase();
 
-function hasTrigger(text)   { return TRIGGER_REGEX.test(text); }
+    // DPS_Chatbridge: allow !g anywhere
+    if (lower === 'dps_chatbridge') {
+        return /!g(?:emini)?\b/i.test(text);
+    }
+
+    // Everyone else: keep stricter rule
+    return /(?:^|>)\s*!g(?:emini)?,?\b/i.test(text);
+}
 function stripTrigger(text) { return text.replace(/(?:^|>)\s*!g(?:emini)?,?\s*/gi, '').trim(); }
 
 // ===================================================================
@@ -1564,8 +1572,7 @@ function setupBotEvents() {
                 .trim();
 
             if (!botReady) return;
-            if (!hasTrigger(cleanText)) return;
-
+if (!hasTrigger(cleanText, realUsername)) return;
             const prompt = stripTrigger(cleanText);
             if (!prompt) {
                 safeChat(`/msg ${realUsername} Please provide a message after !gemini`);
