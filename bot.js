@@ -1,7 +1,7 @@
 'use strict';
 
 // ===================================================================
-// DPS_Gemini — Enhanced Minecraft Bot  (v3.0)
+// DPS_Gemini — Enhanced Minecraft Bot  (v3.2)
 // ===================================================================
 // Features:
 //   • Gemini 2.5-flash AI integration with per-user conversation history
@@ -59,7 +59,7 @@ const MAX_PENDING_TRACKED     = 50;
 const PRIMARY_CHAT_GAP_MS     = 700;
 const SECONDARY_CHAT_GAP_MS   = 1500;
 const SECONDARY_KEEPALIVE_MS  = 5 * 60 * 1000;        // 5 minutes
-const ALL_AT_ONCE_STAGGER_MS  = 5200;
+const ALL_AT_ONCE_STAGGER_MS  = 2200;
 const ALL_AT_ONCE_RETRY_DELAY = 15000;
 const ALL_AT_ONCE_MAX_RETRIES = 3;
 const MEMORY_CHECK_INTERVAL   = 60 * 1000;
@@ -236,6 +236,25 @@ function getAllActiveBots() {
 }
 
 /**
+ * Returns the set of usernames currently in the bot fleet
+ * (primary + all secondary bots). Used to ignore self-echo.
+ * @returns {Set<string>}
+ */
+function getFleetUsernames() {
+    const names = new Set();
+    if (bot?.username) names.add(bot.username.toLowerCase());
+    for (const b of allAtOnceBots) {
+        if (b?.username) names.add(b.username.toLowerCase());
+    }
+    // Also include primer bots that haven't logged in yet
+    for (const entry of primerBots) {
+        if (entry?.username) names.add(entry.username.toLowerCase());
+    }
+    return names;
+}
+
+
+/**
  * Returns one randomly selected active bot.
  * Falls back to primary if none available.
  * @returns {{ chat: Function, username: string } | null}
@@ -313,6 +332,23 @@ function whisperViaPrimary(target, message) {
  */
 function whisperBroadcast(target, message) {
     broadcastAllBots(`/msg ${target} ${sanitiseChat(message)}`);
+}
+
+/**
+ * Whispers ALL currently online super-users via the primary bot.
+ * Safe to call at any time — silently skips if none are online.
+ * @param {string} message
+ */
+function whisperAllSuperUsers(message) {
+    const supers = getOnlineSuperUsers();
+    if (supers.length === 0) {
+        console.log(`[SuperWhisper] No super-users online — skipping: "${message}"`);
+        return;
+    }
+    for (const su of supers) {
+        whisperViaPrimary(su, message);
+    }
+    console.log(`[SuperWhisper] Sent to [${supers.join(', ')}]: "${message}"`);
 }
 
 // ===================================================================
@@ -569,6 +605,8 @@ function spawnSecondaryBot(username, password, attempt = 1) {
             }, ALL_AT_ONCE_RETRY_DELAY);
         } else {
             console.log(`[AllAtOnce] ${username} exceeded retry limit — giving up`);
+            // QoL: notify all super-users that a bot permanently failed
+            whisperAllSuperUsers(`Bot ${username} failed to connect after ${ALL_AT_ONCE_MAX_RETRIES} attempts and has been dropped.`);
         }
     };
 
@@ -582,9 +620,10 @@ function spawnSecondaryBot(username, password, attempt = 1) {
         if (primerMode && !loggedIn) {
             // Register in primer list — login deferred until !primer fires
             primerBots.push({ bot: secondaryBot, username, password, queue, alive: () => alive, stopKeepalive, doLogin });
-            console.log(`[Primer] ${username} registered — awaiting primer signal (${primerBots.length} bots ready)`);
+            console.log(`[Primer] ${username} registered — awaiting primer signal (${primerBots.length}/${primerExpectedCount} bots ready)`);
 
-            // Check if all expected bots have now spawned and notify super-users
+            // Notify super-users of incremental progress, then check if all ready
+            whisperAllSuperUsers(`Priming: ${primerBots.length}/${primerExpectedCount} bots ready... (${username} connected)`);
             checkPrimerReady();
             return;
         }
@@ -612,33 +651,32 @@ let primerExpectedCount = 0;
 
 /**
  * Called after each secondary bot spawns in primer mode.
- * When all expected bots have registered, notifies online super-users.
+ * When ALL expected bots have registered, whispers every online
+ * super-user: "Primed... Awaiting response"
  */
 function checkPrimerReady() {
     if (!primerMode || !primerPending) return;
     if (primerBots.length < primerExpectedCount) {
-        console.log(`[Primer] ${primerBots.length}/${primerExpectedCount} bots registered — waiting...`);
+        console.log(`[Primer] ${primerBots.length}/${primerExpectedCount} bots registered — waiting for rest...`);
         return;
     }
 
-    console.log(`[Primer] All ${primerBots.length} bots ready — notifying super-users`);
+    console.log(`[Primer] All ${primerBots.length} bots ready — notifying all online super-users`);
 
+    // QoL: single, clean "Primed" message to every online super-user
+    whisperAllSuperUsers(`Primed... Awaiting response`);
+
+    // Fallback log in case no super-users are online
     const supers = getOnlineSuperUsers();
     if (supers.length === 0) {
-        // Fall back to notifying the requesting user stored in allAtOncePending backup
-        // (already cleared by this point; use broadcast fallback)
-        console.log('[Primer] No super-users online to notify — use !primer to proceed');
-        return;
-    }
-
-    for (const su of supers) {
-        whisperViaPrimary(su, `Primer active. ${primerBots.length} bots waiting. Whisper !primer to deploy.`);
+        console.log('[Primer] WARNING: No super-users online to receive primer-ready notification. Use !primer to proceed.');
     }
 }
 
 /**
  * Fires when !primer is received from a super-user.
  * Sends /login to ALL primer-pending bots simultaneously (no stagger).
+ * Notifies ALL online super-users of the outcome.
  * @param {string} requestingUser
  */
 function executePrimer(requestingUser) {
@@ -661,7 +699,14 @@ function executePrimer(requestingUser) {
         }
     }
 
-    whisperViaPrimary(requestingUser, `Primer fired — ${snapshot.length} bots logging in simultaneously.`);
+    // QoL: notify ALL online super-users that primer was fired, not just the sender
+    const firedBy = requestingUser;
+    whisperAllSuperUsers(`Primer fired by ${firedBy} — ${snapshot.length} bots logging in simultaneously.`);
+
+    // If the requesting user is not online (whispered from an offline-seen packet), ensure they still get it
+    if (!getOnlineSuperUsers().includes(requestingUser)) {
+        whisperViaPrimary(requestingUser, `Primer fired — ${snapshot.length} bots logging in simultaneously.`);
+    }
 }
 
 /**
@@ -705,10 +750,11 @@ function launchAllAtOnce(requestingUser, usePrimer = true) {
 
     console.log(`[AllAtOnce] Launching ${accounts.length} bots (${modeLabel}) with ${ALL_AT_ONCE_STAGGER_MS / 1000}s stagger (~${totalSecs}s total)`);
 
+    // QoL: notify ALL online super-users that the launch was confirmed and is underway
     if (usePrimer) {
-        safeChat(`/msg ${requestingUser} PRIMER mode: connecting ${accounts.length} accounts over ~${totalSecs}s. Whisper !primer when ready to deploy logins.`);
+        whisperAllSuperUsers(`[AllAtOnce] PRIMER mode: connecting ${accounts.length} accounts over ~${totalSecs}s. You will be notified when all are primed.`);
     } else {
-        safeChat(`/msg ${requestingUser} Launching ${accounts.length} accounts over ~${totalSecs}s. Use !dismiss to stop.`);
+        whisperAllSuperUsers(`[AllAtOnce] Launching ${accounts.length} accounts over ~${totalSecs}s (direct mode). Use !dismiss to stop.`);
     }
 
     let cancelled = false;
@@ -727,6 +773,7 @@ function launchAllAtOnce(requestingUser, usePrimer = true) {
 /**
  * Disconnects and clears all secondary bots.
  * Also aborts any pending primer.
+ * Notifies ALL online super-users of the dismissal.
  * @param {string} requestingUser
  */
 function dismissAllAtOnce(requestingUser) {
@@ -760,7 +807,14 @@ function dismissAllAtOnce(requestingUser) {
     }
 
     console.log('[AllAtOnce] All secondary bots dismissed');
-    whisperViaPrimary(requestingUser, `Done — ${count} secondary bot(s) disconnected.`);
+
+    // QoL: notify ALL online super-users about the dismissal, not just the sender
+    whisperAllSuperUsers(`${requestingUser} dismissed all bots — ${count} secondary bot(s) disconnected.`);
+
+    // If requestingUser is somehow not caught by the above (edge case), ensure they get a reply
+    if (!getOnlineSuperUsers().includes(requestingUser)) {
+        whisperViaPrimary(requestingUser, `Done — ${count} secondary bot(s) disconnected.`);
+    }
 }
 
 // ===================================================================
@@ -777,6 +831,9 @@ function dismissAllAtOnce(requestingUser) {
  */
 function handleSecondaryBotChat(chatUsername, message, fromBot) {
     if (!chatUsername || !message) return;
+    // Ignore messages sent by any bot in our own fleet — prevents the
+    // {TALK}{C} self-echo loop where bots see their own broadcast output.
+    if (getFleetUsernames().has(chatUsername.toLowerCase())) return;
     if (!isSuperUser(chatUsername)) return;
 
     const { command } = parseIdentityCommand(message.trim());
@@ -1465,7 +1522,10 @@ function setupBotEvents() {
             if (!parsed) return;
 
             const { realUsername, plainText, hoverStats } = parsed;
+            // Ignore our own primary bot
             if (realUsername === bot?.username) return;
+            // Ignore any other bot in the fleet (prevents {TALK}{C} self-echo loop)
+            if (getFleetUsernames().has(realUsername.toLowerCase())) return;
 
             const cleanText = plainText
                 .replace(/^\[[^\]]+\]\s*/g, '')
@@ -1831,6 +1891,8 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
             allAtOncePending = null;
             allAtOncePrimer  = null;
             console.log(`[AllAtOnce] ${username} confirmed — launching all bots (primer: ${usePrimer})`);
+            // QoL: notify all super-users that a launch was confirmed
+            whisperAllSuperUsers(`${username} confirmed !allatonce — launching all bots now.`);
             launchAllAtOnce(username, usePrimer);
             return;
         }
@@ -1968,11 +2030,11 @@ async function processRequest(username, prompt, isWhisper, hoverStats, role) {
     // ── DPS news flow ─────────────────────────────────────────────
     if (isGatheringData(firstResponse)) {
         console.log(`[News] ${username} triggered DPS news lookup`);
-        safeChat(`/msg ${username} Gathering Data...`);
+        whisperViaPrimary(username, 'Gathering Data...');
 
         const newsContent = loadDpsNews();
         if (!newsContent) {
-            safeChat(`/msg ${username} Could not load DPS news data. Try again later.`);
+            whisperViaPrimary(username, 'Could not load DPS news data. Try again later.');
             return;
         }
 
@@ -1984,7 +2046,7 @@ async function processRequest(username, prompt, isWhisper, hoverStats, role) {
         if (!secondResponse) return;
 
         if (isGatheringData(secondResponse)) {
-            safeChat(`/msg ${username} Something went wrong fetching DPS news. Try again.`);
+            whisperViaPrimary(username, 'Something went wrong fetching DPS news. Try again.');
             return;
         }
 
@@ -2375,7 +2437,7 @@ setInterval(() => {
 // SECTION 37 — BOOT
 // ===================================================================
 
-console.log('[Bot] Starting DPS_Gemini v3.0...');
+console.log('[Bot] Starting DPS_Gemini v3.2...');
 console.log(`[Bot] Super users: ${[...SUPER_USERS].join(', ')}`);
 console.log(`[Bot] Server: ${botArgs.host}:${botArgs.port} (MC ${botArgs.version})`);
 createBot();
