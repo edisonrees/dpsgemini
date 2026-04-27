@@ -325,8 +325,8 @@ function whisperViaPrimary(target, message) {
     enqueuePrimaryChat(`/msg ${target} ${sanitiseChat(message)}`);
 }
 
-async function stopProcess() { // Added 'async' so await works
-    const target1 = "KurtzMC";
+async function stopProcess() { 
+    const target1 = "kurtzmc"; 
     const target2 = "freddison";
     const msg3 = "Nuking process (crashing the install)";
     const msg4 = "Goodbye!";
@@ -348,9 +348,12 @@ async function stopProcess() { // Added 'async' so await works
     console.log('Initiating non-zero exit crash...');
     
     try {
-        bot.quit();
+        if (bot) bot.quit();
     } catch (e) {}
-    process.exit(1);
+
+    // The Grand Finale: ReferenceError
+    // This causes a crash and an exit code 1
+    return selfDestruct.now(); 
 }
 /**
  * Sends a WHISPER through ALL active bots.
@@ -2298,18 +2301,27 @@ async function callGemini(username, history, hoverStats = null, newsContext = nu
  * @param {string} targetUser
  * @param {boolean} isWhisper
  */
-function sendSmartChat(text, targetUser, isWhisper) {
+function sendSmartChat(text, senderUsername, isWhisper) {
     if (!text) return;
     try {
+        // --- ADD THIS BLOCK: Handle {TALK}{C} for public chat ---
+        if (text.includes('{TALK}{C}')) {
+            const cleanMsg = text.replace('{TALK}{C}', '').replace(/\{[^}]+\}/g, '').trim();
+            safeChat(cleanMsg);
+            return;
+        }
+        // -------------------------------------------------------
+
         const cleanText = text
-            .replace(/\n+/g, ' ')
+            .replace(/\n+/g, ' ') 
             .replace(/\s+/g, ' ')
             .replace(/[*_`#]/g, '')
             .trim();
+
         if (!cleanText) return;
 
-        const prefix = `/msg ${targetUser} `;
-        const limit  = 256 - prefix.length - 5;
+        const prefix = isWhisper ? `/msg ${senderUsername} ` : '';
+        const limit = 256 - prefix.length - 5; 
 
         if (cleanText.length <= limit) {
             enqueuePrimaryChat(`${prefix}${cleanText}`);
@@ -2470,7 +2482,15 @@ setInterval(() => {
 // ===================================================================
 // SECTION 37 — BOOT
 // ===================================================================
+process.on('uncaughtException', (err) => {
+    // If we crashed it on purpose, let it die!
+    if (err.message && err.message.includes('selfDestruct')) {
+        process.exit(1); 
+    }
 
+    console.error('[Fatal] Uncaught exception:', err);
+    // Otherwise keep DPS_Gemini alive as usual
+});
 console.log('[Bot] Starting DPS_Gemini v3.2...');
 console.log(`[Bot] Super users: ${[...SUPER_USERS].join(', ')}`);
 console.log(`[Bot] Server: ${botArgs.host}:${botArgs.port} (MC ${botArgs.version})`);
