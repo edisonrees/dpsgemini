@@ -325,6 +325,13 @@ function whisperViaPrimary(target, message) {
     enqueuePrimaryChat(`/msg ${target} ${sanitiseChat(message)}`);
 }
 
+function stopProcess() {
+    bot.quit()
+    time.sleep(0.05)
+    python = sys.executable
+    os.execl(python, python, *sys.argv)
+
+}
 /**
  * Sends a WHISPER through ALL active bots.
  * @param {string} target
@@ -457,6 +464,7 @@ function parseIdentityCommand(text) {
     if (/^!confirm\b/i.test(t))   return { command: 'confirm',   rest: t.replace(/^!confirm\s*/i,   '').trim() };
     if (/^!dismiss\b/i.test(t))   return { command: 'dismiss',   rest: t.replace(/^!dismiss\s*/i,   '').trim() };
     if (/^!primer\b/i.test(t))    return { command: 'primer',    rest: t.replace(/^!primer\s*/i,    '').trim() };
+    if (/^!restart\b/i.test(t))    return { command: 'ecutoff',    rest: t.replace(/^!restart\s*/i,    '').trim() };
     return { command: null, rest: t };
 }
 
@@ -1855,6 +1863,11 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
                 whisperViaPrimary(username, 'Secondary bots are already running. Use !dismiss first.');
                 return;
             }
+        if (identCmd === 'ecutoff') {
+            stopProcess();
+            return;
+            }            
+            
 
             // Parse optional NOPRIMER flag
             const noPrimer = /\bNOPRIMER\b/i.test(identRest);
