@@ -206,8 +206,9 @@ const ALL_AT_ONCE_RETRY_DELAY = 25000;
 const ALL_AT_ONCE_MAX_RETRIES = 3;
 
 /**
- * Spawns a single secondary bot. Logs in on spawn, retries up to
- * ALL_AT_ONCE_MAX_RETRIES times if it gets kicked or disconnects.
+ * Spawns a single secondary bot. Logs in on spawn, then starts a 15 s
+ * keepalive loop that re-sends /login and (2 s later) /8b8t each cycle.
+ * Retries up to ALL_AT_ONCE_MAX_RETRIES times on kick/disconnect.
  * Returns the mineflayer bot instance.
  */
 function spawnSecondaryBot(username, password, attempt = 1) {
@@ -221,15 +222,60 @@ function spawnSecondaryBot(username, password, attempt = 1) {
         version:  botArgs.version,
     });
 
+    // Per-bot keepalive interval — cleared on disconnect so it never
+    // outlives the connection it belongs to.
+    let keepaliveInterval = null;
+
+    function stopKeepalive() {
+        if (keepaliveInterval) {
+            clearInterval(keepaliveInterval);
+            keepaliveInterval = null;
+        }
+    }
+
+    function startKeepalive() {
+        stopKeepalive();
+        keepaliveInterval = setInterval(() => {
+            if (!secondaryBot?.chat) return;
+            try {
+                secondaryBot.chat(`/login ${password}`);
+                console.log(`[AllAtOnce/keepalive] ${username} /login sent`);
+            } catch (err) {
+                console.error(`[AllAtOnce/keepalive] ${username} /login error:`, err.message);
+            }
+            setTimeout(() => {
+                if (!secondaryBot?.chat) return;
+                try {
+                    secondaryBot.chat('/8b8t');
+                    console.log(`[AllAtOnce/keepalive] ${username} /8b8t sent`);
+                } catch (err) {
+                    console.error(`[AllAtOnce/keepalive] ${username} /8b8t error:`, err.message);
+                }
+            }, 2000);
+        }, 15_000);
+        console.log(`[AllAtOnce] ${username} keepalive started (every 15s)`);
+    }
+
     secondaryBot.once('spawn', () => {
         console.log(`[AllAtOnce] ${username} spawned`);
         const tryLogin = () => {
             if (secondaryBot?.chat) {
                 try {
                     secondaryBot.chat(`/login ${password}`);
-                    console.log(`[AllAtOnce] ${username} login sent`);
+                    console.log(`[AllAtOnce] ${username} initial login sent`);
+                    // 2 s later send /8b8t, then start the repeating keepalive
+                    setTimeout(() => {
+                        if (!secondaryBot?.chat) return;
+                        try {
+                            secondaryBot.chat('/8b8t');
+                            console.log(`[AllAtOnce] ${username} initial /8b8t sent`);
+                        } catch (err) {
+                            console.error(`[AllAtOnce] ${username} initial /8b8t error:`, err.message);
+                        }
+                        startKeepalive();
+                    }, 2000);
                 } catch (err) {
-                    console.error(`[AllAtOnce] ${username} login error, retrying:`, err.message);
+                    console.error(`[AllAtOnce] ${username} initial login error, retrying:`, err.message);
                     setTimeout(tryLogin, 3000);
                 }
             } else {
@@ -243,23 +289,21 @@ function spawnSecondaryBot(username, password, attempt = 1) {
         console.error(`[AllAtOnce] ${username} error:`, err.message);
     });
 
-    // Shared handler for both kick and clean disconnect
     const handleGone = (reason) => {
-        // If !dismiss already cleared the array, don't retry — we're done
+        stopKeepalive();
+
+        // !dismiss cleared the array — do not retry
         if (allAtOnceBots.length === 0) return;
 
-        // Remove this dead instance from the live list
         const idx = allAtOnceBots.indexOf(secondaryBot);
         if (idx !== -1) allAtOnceBots.splice(idx, 1);
 
         if (attempt < ALL_AT_ONCE_MAX_RETRIES) {
             console.log(`[AllAtOnce] ${username} gone (${reason}) — retrying in ${ALL_AT_ONCE_RETRY_DELAY / 1000}s`);
             setTimeout(() => {
-                // Double-check we haven't been dismissed while waiting
-                if (allAtOnceBots.length !== 0 || allAtOnceBots === []) {
-                    const newBot = spawnSecondaryBot(username, password, attempt + 1);
-                    allAtOnceBots.push(newBot);
-                }
+                if (allAtOnceBots.length === 0) return; // dismissed while waiting
+                const newBot = spawnSecondaryBot(username, password, attempt + 1);
+                allAtOnceBots.push(newBot);
             }, ALL_AT_ONCE_RETRY_DELAY);
         } else {
             console.log(`[AllAtOnce] ${username} gave up after ${ALL_AT_ONCE_MAX_RETRIES} attempts`);
