@@ -1,14 +1,40 @@
-const mineflayer = require('mineflayer');
-const { GoogleGenAI, ThinkingLevel } = require("@google/genai");
-const fs = require('fs');
+'use strict';
 
-// --- CONFIGURATION ---
+// ===================================================================
+// DPS_Gemini — Enhanced Minecraft Bot  (v3.0)
+// ===================================================================
+// Features:
+//   • Gemini 2.5-flash AI integration with per-user conversation history
+//   • Primary chat queue with spam-kick prevention
+//   • !allatonce — launches all configured accounts simultaneously
+//   • PRIMER mode — holds all logins until !primer fires, then logs
+//     all bots in simultaneously for a synchronised appearance
+//   • Identity switching (!switch / !incognito / !normal)
+//   • Super-user commands work without !g prefix
+//   • All bot events (TALK, MULTITALK) broadcast through ALL active bots
+//   • AI text responses sent through ONE randomly chosen active bot
+//   • !dismiss monitored through all secondary bots
+//   • DPS_Gemini guaranteed always-online unless explicitly switched
+//   • Temp whitelist / ban / revoke system
+//   • Memory watchdog + periodic cleanup
+//   • Exponential-backoff reconnect
+//   • ASCII-safe chat sanitiser
+// ===================================================================
+
+const mineflayer        = require('mineflayer');
+const { GoogleGenAI, ThinkingLevel } = require('@google/genai');
+const fs                = require('fs');
+
+// -------------------------------------------------------------------
+// CONFIGURATION
+// -------------------------------------------------------------------
+
 const botArgs = {
-    host: '8b8t.me',
-    port: 25565,
+    host:     '8b8t.me',
+    port:     25565,
     username: 'DPS_Gemini',
-    auth: 'offline',
-    version: '1.20.1'
+    auth:     'offline',
+    version:  '1.20.1',
 };
 
 const API_KEY  = process.env.API_KEY;
@@ -16,58 +42,83 @@ const PASSWORD = process.env.MC_PASSWORD;
 
 const ai = new GoogleGenAI({ apiKey: API_KEY });
 
-// --- STATE ---
+// -------------------------------------------------------------------
+// CONSTANTS
+// -------------------------------------------------------------------
+
+const MAX_RECONNECT_ATTEMPTS  = 10000;
+const RECONNECT_DELAY         = 15000;
+const MSG_LIMIT               = 5;
+const TIME_WINDOW             = 2 * 60 * 1000;        // 2 minutes
+const MAX_RETRIES             = 3;
+const RETRY_DELAY             = 2000;
+const API_GAP_MS              = 5000;
+const MAX_USERS_TRACKED       = 150;
+const MAX_PENDING_TRACKED     = 50;
+const PRIMARY_CHAT_GAP_MS     = 700;
+const SECONDARY_CHAT_GAP_MS   = 1500;
+const SECONDARY_KEEPALIVE_MS  = 5 * 60 * 1000;        // 5 minutes
+const ALL_AT_ONCE_STAGGER_MS  = 12000;
+const ALL_AT_ONCE_RETRY_DELAY = 30000;
+const ALL_AT_ONCE_MAX_RETRIES = 3;
+const MEMORY_CHECK_INTERVAL   = 60 * 1000;
+const MEMORY_LIMIT_MB         = 400;
+const HANDLED_PACKET_TTL      = 5000;
+const DPS_NEWS_PATH           = 'dps_news.txt';
+
+// The two superusers allowed to trigger identity/admin commands.
+const SUPER_USERS = new Set(['freddison', 'kurtzmc']);
+
+// -------------------------------------------------------------------
+// MUTABLE STATE
+// -------------------------------------------------------------------
+
 let bot;
-let reconnecting        = false;
-let reconnectAttempts   = 0;
-const MAX_RECONNECT_ATTEMPTS = 10000;
-const RECONNECT_DELAY        = 15000;
-let approvedPlayers = new Set();
-let botReady        = false;
+let reconnecting       = false;
+let reconnectAttempts  = 0;
+let botReady           = false;
+let approvedPlayers    = new Set();
+let lastApiCall        = 0;
 
-// Map of username (lowercase) -> { remaining: number | Infinity }
-const tempWhitelist = new Map();
+// Active identity
+let activeMode     = 'normal';    // 'normal' | 'switch' | 'incognito'
+let activeIndex    = null;
+let currentPassword = PASSWORD;
 
-// Map of username (lowercase) -> expiry timestamp (ms). Infinity = permanent ban.
-const tempBans = new Map();
+// Maps and sets
+const tempWhitelist    = new Map();   // lcUsername -> { remaining: number|Infinity }
+const tempBans         = new Map();   // lcUsername -> expiry ms (or Infinity)
+const onlinePlayers    = new Set();   // exact-case usernames currently online
+const userCooldowns    = new Map();   // username -> timestamp[]
+const userConversations = new Map();  // username -> history[]
+const pendingRequests  = new Set();
+const handledByPacket  = new Map();   // username -> clearTimeout handle
 
-// Set of currently online player usernames (exact case from server)
-const onlinePlayers = new Set();
-
-// Primary bot outgoing chat queue — every safeChat/whisper/command
-// goes through this so we never flood the server and get spam-kicked.
+// Primary bot outgoing chat queue
 const primaryChatQueue  = [];
 let primaryChatDraining = false;
 
-// Gap between successive primary-bot chat sends.
-// 8b8t's spam detector triggers if you send faster than ~1 msg/700ms.
-const PRIMARY_CHAT_GAP_MS = 700;
+// !allatonce state
+let allAtOncePending = null;         // username who triggered !allatonce, or null
+let allAtOnceBots    = [];           // active secondary bot instances
 
-// Tracked packet-handled whispers to avoid double-processing.
-const handledByPacket    = new Map(); // username -> clearTimeout handle
-const HANDLED_PACKET_TTL = 5000;
+// Primer state
+// primerMode:    whether the current !allatonce launch is using PRIMER
+// primerPending: true while waiting for !primer command
+// primerBots:    bots that have spawned but are waiting to log in
+let primerMode    = false;
+let primerPending = false;
+const primerBots  = [];              // { bot, username, password, queue, alive, stopKeepalive, doLogin }
 
-const userCooldowns     = new Map();
-const userConversations = new Map();
-const pendingRequests   = new Set();
+// 8b8t keepalive interval handle
+let eightb8tInterval = null;
 
-const MSG_LIMIT   = 5;
-const TIME_WINDOW = 2 * 60 * 1000;   // 2 minutes
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 2000;
-const API_GAP_MS  = 5000;
-let lastApiCall   = 0;
+// Regex for gathering-data signal
+const GATHERING_DATA_REGEX = /^\s*Gathering Data\.{3}\s*$/i;
 
-const MAX_USERS_TRACKED   = 150;
-const MAX_PENDING_TRACKED = 50;
-
-// -------------------------------------------------------------------
-// CHAT SANITISER
-// -------------------------------------------------------------------
-// 8b8t (1.20.1) runs a strict ASCII-printable whitelist on incoming
-// chat packets. Any character outside 0x20–0x7E causes an immediate
-// kick with "Illegal characters in chat". This sanitiser is applied
-// to EVERY outgoing message before it is sent.
+// ===================================================================
+// SECTION 1 — SANITISER
+// ===================================================================
 
 /**
  * Strips non-printable-ASCII characters and Minecraft colour codes
@@ -78,22 +129,17 @@ const MAX_PENDING_TRACKED = 50;
 function sanitiseChat(text) {
     if (typeof text !== 'string') return '';
     return text
-        .replace(/[^\x20-\x7E]/g, '')   // keep only printable ASCII
-        .replace(/§./g, '')              // strip §x colour codes
+        .replace(/[^\x20-\x7E]/g, '')
+        .replace(/§./g, '')
         .trim();
 }
 
-// -------------------------------------------------------------------
-// PRIMARY CHAT QUEUE
-// -------------------------------------------------------------------
-// All outgoing messages from the primary bot are serialised through
-// this queue. This prevents spam kicks caused by multiple systems
-// (Gemini replies, keepalives, whispers, commands) sending
-// simultaneously.
+// ===================================================================
+// SECTION 2 — PRIMARY CHAT QUEUE
+// ===================================================================
 
 /**
  * Enqueues a message to be sent by the primary bot.
- * The message is sanitised before queuing.
  * @param {string} message
  */
 function enqueuePrimaryChat(message) {
@@ -104,20 +150,16 @@ function enqueuePrimaryChat(message) {
 }
 
 /**
- * Drains the primary chat queue one message at a time,
- * with PRIMARY_CHAT_GAP_MS between each send.
- * If the bot is not ready, pauses and retries after 3 s.
+ * Drains the primary chat queue one message at a time.
  */
 function drainPrimaryChat() {
     if (primaryChatQueue.length === 0) {
         primaryChatDraining = false;
         return;
     }
-
     primaryChatDraining = true;
 
     if (!bot || !botReady || !bot.chat || !bot._client) {
-        // Bot not ready — pause and retry shortly
         setTimeout(drainPrimaryChat, 3000);
         return;
     }
@@ -128,53 +170,24 @@ function drainPrimaryChat() {
     } catch (err) {
         console.error('[PrimaryQueue] Send error:', err.message);
     }
-
     setTimeout(drainPrimaryChat, PRIMARY_CHAT_GAP_MS);
 }
 
 /**
  * Safe wrapper — all outbound primary-bot messages go through the queue.
- * Kept as a named function for call-site clarity.
  * @param {string} message
  */
 function safeChat(message) {
     enqueuePrimaryChat(message);
 }
 
-// -------------------------------------------------------------------
-// IDENTITY MODE  (normal | switch | incognito)
-// -------------------------------------------------------------------
-// Tracks the current active identity the bot is logged in as.
-// activeMode:  'normal' | 'switch' | 'incognito'
-// activeIndex: the slot number chosen, or null in normal mode.
-
-let activeMode  = 'normal';
-let activeIndex = null;
-
-// The two superusers allowed to trigger identity commands.
-const SUPER_USERS = new Set(['freddison', 'kurtzmc']);
-
-// -------------------------------------------------------------------
-// ALL-AT-ONCE STATE
-// -------------------------------------------------------------------
-// allAtOncePending: username who ran !allatonce and hasn't confirmed, or null.
-// allAtOnceBots:    Array of active secondary mineflayer bot instances.
-
-let allAtOncePending = null;
-let allAtOnceBots    = [];
-
-// -------------------------------------------------------------------
-// SECONDARY BOT CHAT
-// -------------------------------------------------------------------
-// Each secondary bot gets its own serialised chat queue so it cannot
-// flood the server. The gap is intentionally wider than the primary's
-// to reduce total network load.
-
-const SECONDARY_CHAT_GAP_MS = 1500;
+// ===================================================================
+// SECTION 3 — SECONDARY BOT CHAT QUEUE
+// ===================================================================
 
 /**
  * Creates a per-bot serialised chat queue.
- * @param {{ bot: import('mineflayer').Bot }} botRef - mutable reference to the bot instance
+ * @param {{ bot: import('mineflayer').Bot }} botRef
  * @returns {{ send: (message: string) => void }}
  */
 function makeSecondaryQueue(botRef) {
@@ -193,10 +206,6 @@ function makeSecondaryQueue(botRef) {
         setTimeout(drain, SECONDARY_CHAT_GAP_MS);
     }
 
-    /**
-     * Sanitises and enqueues a message for this secondary bot.
-     * @param {string} message
-     */
     function send(message) {
         const clean = sanitiseChat(message);
         if (!clean) return;
@@ -207,42 +216,145 @@ function makeSecondaryQueue(botRef) {
     return { send };
 }
 
-// -------------------------------------------------------------------
-// SUPER USER HELPER
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 4 — BROADCAST HELPERS
+// ===================================================================
+
+/**
+ * Returns the full list of live bot references:
+ * primary (if ready) + all secondary bots.
+ * @returns {Array<{ chat: Function, username: string }>}
+ */
+function getAllActiveBots() {
+    const bots = [];
+    if (bot && botReady && bot.chat && bot._client) bots.push(bot);
+    for (const b of allAtOnceBots) {
+        if (b && b.chat) bots.push(b);
+    }
+    return bots;
+}
+
+/**
+ * Returns one randomly selected active bot.
+ * Falls back to primary if none available.
+ * @returns {{ chat: Function, username: string } | null}
+ */
+function getRandomBot() {
+    const active = getAllActiveBots();
+    if (active.length === 0) return null;
+    return active[Math.floor(Math.random() * active.length)];
+}
+
+/**
+ * Sends a message through ALL active bots (primary + secondary).
+ * Each bot uses its own queue.
+ * @param {string} message
+ */
+function broadcastAllBots(message) {
+    const clean = sanitiseChat(message);
+    if (!clean) return;
+
+    // Primary bot
+    if (bot && botReady && bot.chat && bot._client) {
+        enqueuePrimaryChat(clean);
+    }
+
+    // Secondary bots — each has its own _queue attached
+    for (const b of allAtOnceBots) {
+        if (b && b._queue) {
+            b._queue.send(clean);
+        } else if (b && b.chat) {
+            // Fallback: direct send (shouldn't normally happen)
+            try { b.chat(clean); } catch (err) { console.error('[Broadcast] Direct send error:', err.message); }
+        }
+    }
+}
+
+/**
+ * Sends a message through ONE randomly chosen active bot.
+ * Whispers (/msg target) should use the primary to avoid reply confusion,
+ * but public chat / AI replies use a random bot.
+ * @param {string} message
+ * @param {boolean} [forceRandom=false]
+ */
+function sendViaRandomBot(message, forceRandom = false) {
+    const clean = sanitiseChat(message);
+    if (!clean) return;
+
+    const chosen = forceRandom ? getRandomBot() : null;
+
+    if (!chosen || chosen === bot) {
+        // Use primary queue
+        enqueuePrimaryChat(clean);
+        return;
+    }
+
+    if (chosen._queue) {
+        chosen._queue.send(clean);
+    } else {
+        try { chosen.chat(clean); } catch (err) { console.error('[RandomBot] Send error:', err.message); }
+    }
+}
+
+/**
+ * Sends a WHISPER through the primary bot only (so /msg replies land correctly).
+ * @param {string} target
+ * @param {string} message
+ */
+function whisperViaPrimary(target, message) {
+    enqueuePrimaryChat(`/msg ${target} ${sanitiseChat(message)}`);
+}
+
+/**
+ * Sends a WHISPER through ALL active bots.
+ * @param {string} target
+ * @param {string} message
+ */
+function whisperBroadcast(target, message) {
+    broadcastAllBots(`/msg ${target} ${sanitiseChat(message)}`);
+}
+
+// ===================================================================
+// SECTION 5 — SUPER USER HELPER
+// ===================================================================
 
 /** @param {string} username */
 function isSuperUser(username) {
     return SUPER_USERS.has(username.toLowerCase());
 }
 
-// -------------------------------------------------------------------
-// IDENTITY CREDENTIAL RESOLVER
-// -------------------------------------------------------------------
+/**
+ * Returns all online super-users (exact-case from onlinePlayers).
+ * @returns {string[]}
+ */
+function getOnlineSuperUsers() {
+    return [...onlinePlayers].filter(name => isSuperUser(name));
+}
+
+// ===================================================================
+// SECTION 6 — IDENTITY CREDENTIALS
+// ===================================================================
 
 /**
- * Returns the bot credentials for a given mode + slot index.
- * For 'normal':    uses the default DPS_Gemini username + MC_PASSWORD.
- * For 'switch':    reads SWITCH{N} and SPASS{N} env vars.
- * For 'incognito': reads INCOG{N}  and IPASS{N}  env vars.
- *
+ * Returns bot credentials for a given mode + slot.
  * @param {'normal'|'switch'|'incognito'} mode
  * @param {number|null} index
  * @returns {{ username: string, password: string } | null}
  */
 function getIdentityCredentials(mode, index) {
-    if (mode === 'normal')    return { username: 'DPS_Gemini',                         password: PASSWORD                        };
-    if (mode === 'switch')    return { username: process.env[`SWITCH${index}`] ?? null, password: process.env[`SPASS${index}`] ?? null };
-    if (mode === 'incognito') return { username: process.env[`INCOG${index}`]  ?? null, password: process.env[`IPASS${index}`]  ?? null };
+    if (mode === 'normal')    return { username: 'DPS_Gemini',                          password: PASSWORD                         };
+    if (mode === 'switch')    return { username: process.env[`SWITCH${index}`] ?? null,  password: process.env[`SPASS${index}`] ?? null };
+    if (mode === 'incognito') return { username: process.env[`INCOG${index}`]  ?? null,  password: process.env[`IPASS${index}`]  ?? null };
     return null;
 }
 
 /**
- * Switches the bot's identity. Disconnects the current session and
- * reconnects using the credentials for the requested mode + slot.
+ * Switches the primary bot's identity.
+ * If the current bot is NOT DPS_Gemini, the switch pipeline first
+ * restores DPS_Gemini then initiates the desired switch.
  *
  * @param {'switch'|'incognito'} mode
- * @param {number} index - slot number
+ * @param {number} index
  * @param {string} requestingUser
  */
 function switchIdentity(mode, index, requestingUser) {
@@ -266,17 +378,36 @@ function switchIdentity(mode, index, requestingUser) {
     scheduleReconnect(`identity-switch-to-${mode}`);
 }
 
-// currentPassword shadows the module-level PASSWORD for the active session
-// so we don't have to mutate the const. Initialised to the default password.
-let currentPassword = PASSWORD;
+/**
+ * Restores the primary bot to the DPS_Gemini identity.
+ * @param {string} requestingUser
+ */
+function restoreNormalIdentity(requestingUser) {
+    if (activeMode === 'normal') {
+        safeChat(`/msg ${requestingUser} Already running as the normal identity.`);
+        return;
+    }
 
-// -------------------------------------------------------------------
-// IDENTITY COMMAND PARSERS
-// -------------------------------------------------------------------
-// Strips !switch / !incognito / !normal / !allatonce / !confirm / !dismiss
-// from a message string and returns the command name + remaining text.
+    botArgs.username = 'DPS_Gemini';
+    currentPassword  = PASSWORD;
+    activeMode       = 'normal';
+    activeIndex      = null;
+
+    console.log(`[Identity] ${requestingUser} restored normal identity`);
+    safeChat(`/msg ${requestingUser} Reverting to normal identity... reconnecting.`);
+    stop8b8tLoop();
+    scheduleReconnect('identity-switch-to-normal');
+}
+
+// ===================================================================
+// SECTION 7 — IDENTITY COMMAND PARSERS
+// ===================================================================
 
 /**
+ * Parses an identity/control command from a message string.
+ * Strips !switch / !incognito / !normal / !allatonce / !confirm /
+ * !dismiss / !primer from the beginning of the text.
+ *
  * @param {string} text
  * @returns {{ command: string|null, rest: string }}
  */
@@ -288,66 +419,40 @@ function parseIdentityCommand(text) {
     if (/^!allatonce\b/i.test(t)) return { command: 'allatonce', rest: t.replace(/^!allatonce\s*/i, '').trim() };
     if (/^!confirm\b/i.test(t))   return { command: 'confirm',   rest: t.replace(/^!confirm\s*/i,   '').trim() };
     if (/^!dismiss\b/i.test(t))   return { command: 'dismiss',   rest: t.replace(/^!dismiss\s*/i,   '').trim() };
+    if (/^!primer\b/i.test(t))    return { command: 'primer',    rest: t.replace(/^!primer\s*/i,    '').trim() };
     return { command: null, rest: t };
 }
 
-// -------------------------------------------------------------------
-// ALL-AT-ONCE HELPERS
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 8 — ALL-AT-ONCE & PRIMER
+// ===================================================================
 
 /**
- * Collects every valid credential set across all switch and incognito slots.
- * Returns an array of { username, password, label } objects.
+ * Collects every valid credential set across all switch/incognito slots.
  * Skips any slot whose env vars are missing or empty.
- *
  * @returns {{ username: string, password: string, label: string }[]}
  */
 function getAllAccountCredentials() {
     const accounts = [];
-
     for (let n = 1; n <= 5; n++) {
         const username = process.env[`SWITCH${n}`];
         const password = process.env[`SPASS${n}`];
         if (username && password) accounts.push({ username, password, label: `SWITCH${n}` });
     }
-
     for (let n = 1; n <= 8; n++) {
         const username = process.env[`INCOG${n}`];
         const password = process.env[`IPASS${n}`];
         if (username && password) accounts.push({ username, password, label: `INCOG${n}` });
     }
-
     return accounts;
 }
 
-// Time between each secondary bot connection attempt.
-// Wide enough to avoid simultaneous TCP handshakes triggering the
-// server's connection rate limiter.
-const ALL_AT_ONCE_STAGGER_MS = 12000;
-
-// How long to wait before retrying a secondary bot that dropped.
-const ALL_AT_ONCE_RETRY_DELAY = 30000;
-
-// How many times a secondary bot will retry before giving up.
-const ALL_AT_ONCE_MAX_RETRIES = 3;
-
-// Keepalive interval for secondary bots.
-// 5 minutes keeps the session alive without hammering the server.
-// The old 15-second interval caused the primary bot to be spam-kicked
-// because all secondary bots were sending login+8b8t every 15 s,
-// flooding the server simultaneously.
-const SECONDARY_KEEPALIVE_MS = 5 * 60 * 1000;
-
 /**
  * Spawns a single secondary bot with its own chat queue and keepalive loop.
- * Login is sent on spawn; subsequent keepalives fire every 5 minutes.
- * Retries up to ALL_AT_ONCE_MAX_RETRIES times on kick/disconnect.
  *
- * Key fix: the 'message' event listener has been intentionally REMOVED.
- * The old version relayed every server message through the primary bot's
- * chat queue, which caused the primary to be spam-kicked the moment any
- * secondary bot connected (server join broadcasts alone were enough to
- * trigger the kick threshold).
+ * If primerMode is true, the bot will connect but NOT send /login until
+ * the primer fires (via executePrimer). In that case, doLogin is stored
+ * on the primerBots array entry.
  *
  * @param {string} username
  * @param {string} password
@@ -355,7 +460,7 @@ const SECONDARY_KEEPALIVE_MS = 5 * 60 * 1000;
  * @returns {import('mineflayer').Bot}
  */
 function spawnSecondaryBot(username, password, attempt = 1) {
-    console.log(`[AllAtOnce] Connecting ${username} (attempt ${attempt}/${ALL_AT_ONCE_MAX_RETRIES})`);
+    console.log(`[AllAtOnce] Connecting ${username} (attempt ${attempt}/${ALL_AT_ONCE_MAX_RETRIES})${primerMode ? ' [PRIMER]' : ''}`);
 
     const secondaryBot = mineflayer.createBot({
         host:    botArgs.host,
@@ -369,12 +474,16 @@ function spawnSecondaryBot(username, password, attempt = 1) {
     const botRef = { bot: secondaryBot };
     const queue  = makeSecondaryQueue(botRef);
 
+    // Attach queue so broadcastAllBots can reach it
+    secondaryBot._queue = queue;
+
     let keepaliveInterval = null;
     let alive             = true;
+    let loggedIn          = false; // set true when login has been sent
 
-    // -----------------------------------------------------------
-    // KEEPALIVE MANAGEMENT
-    // -----------------------------------------------------------
+    // ------------------------------------------------------------------
+    // KEEPALIVE
+    // ------------------------------------------------------------------
 
     const stopKeepalive = () => {
         if (keepaliveInterval) {
@@ -383,52 +492,69 @@ function spawnSecondaryBot(username, password, attempt = 1) {
         }
     };
 
-    /**
-     * Starts a 5-minute keepalive loop that re-sends /login then /8b8t
-     * (3 s later) each cycle. Both are queued through the per-bot queue
-     * so they cannot pile up.
-     */
     const startKeepalive = () => {
         stopKeepalive();
-
         keepaliveInterval = setInterval(() => {
             if (!alive || !secondaryBot?.chat) return;
-
             queue.send(`/login ${password}`);
             console.log(`[AllAtOnce/keepalive] ${username} /login queued`);
-
             setTimeout(() => {
                 if (!alive || !secondaryBot?.chat) return;
                 queue.send('/8b8t');
                 console.log(`[AllAtOnce/keepalive] ${username} /8b8t queued`);
             }, 3000);
-
         }, SECONDARY_KEEPALIVE_MS);
-
         console.log(`[AllAtOnce] ${username} keepalive active (${SECONDARY_KEEPALIVE_MS / 60000} min interval)`);
     };
 
-    // -----------------------------------------------------------
-    // SHUTDOWN / RETRY HANDLER
-    // -----------------------------------------------------------
+    // ------------------------------------------------------------------
+    // LOGIN SEQUENCE (called either immediately or when primer fires)
+    // ------------------------------------------------------------------
 
-    /**
-     * Called on kick or end. Cleans up, removes from the active list,
-     * and schedules a retry unless the bot was dismissed.
-     * @param {string} reason
-     */
+    const doLogin = () => {
+        if (!alive || !secondaryBot?.chat) return;
+        loggedIn = true;
+        queue.send(`/login ${password}`);
+        console.log(`[AllAtOnce] ${username} login queued`);
+        setTimeout(() => {
+            if (!alive || !secondaryBot?.chat) return;
+            queue.send('/8b8t');
+            console.log(`[AllAtOnce] ${username} initial /8b8t queued`);
+            startKeepalive();
+        }, 3000);
+    };
+
+    // ------------------------------------------------------------------
+    // MONITOR !dismiss from every secondary bot
+    // ------------------------------------------------------------------
+
+    secondaryBot.on('chat', (chatUsername, message) => {
+        handleSecondaryBotChat(chatUsername, message, secondaryBot);
+    });
+
+    // Also listen to raw packets for whispers (same as primary)
+    secondaryBot.on('whisper', (wUsername, wMessage) => {
+        handleSecondaryBotWhisper(wUsername, wMessage, secondaryBot);
+    });
+
+    // ------------------------------------------------------------------
+    // SHUTDOWN / RETRY
+    // ------------------------------------------------------------------
+
     const handleShutdown = (reason) => {
         if (!alive) return;
         alive = false;
-
         stopKeepalive();
+
+        // Remove from primer bots if pending
+        const primerIdx = primerBots.findIndex(e => e.bot === secondaryBot);
+        if (primerIdx !== -1) primerBots.splice(primerIdx, 1);
 
         const idx = allAtOnceBots.indexOf(secondaryBot);
         if (idx !== -1) allAtOnceBots.splice(idx, 1);
 
-        // If allAtOnceBots was cleared by !dismiss and no launch is
-        // pending, the session was intentionally ended — don't retry.
-        if (allAtOnceBots.length === 0 && allAtOncePending === null) {
+        // Don't retry if dismissed
+        if (allAtOnceBots.length === 0 && allAtOncePending === null && !primerPending) {
             console.log(`[AllAtOnce] ${username} dropped (${reason}) — dismissed, not retrying`);
             return;
         }
@@ -436,8 +562,7 @@ function spawnSecondaryBot(username, password, attempt = 1) {
         if (attempt < ALL_AT_ONCE_MAX_RETRIES) {
             console.log(`[AllAtOnce] ${username} dropped (${reason}) — retrying in ${ALL_AT_ONCE_RETRY_DELAY / 1000}s`);
             setTimeout(() => {
-                // Abort if dismissed while waiting
-                if (allAtOnceBots.length === 0 && allAtOncePending === null) return;
+                if (allAtOnceBots.length === 0 && allAtOncePending === null && !primerPending) return;
                 const newBot = spawnSecondaryBot(username, password, attempt + 1);
                 allAtOnceBots.push(newBot);
             }, ALL_AT_ONCE_RETRY_DELAY);
@@ -446,35 +571,29 @@ function spawnSecondaryBot(username, password, attempt = 1) {
         }
     };
 
-    // -----------------------------------------------------------
-    // BOT EVENTS
-    // -----------------------------------------------------------
+    // ------------------------------------------------------------------
+    // EVENTS
+    // ------------------------------------------------------------------
 
     secondaryBot.once('spawn', () => {
         console.log(`[AllAtOnce] ${username} spawned`);
 
-        // Wait 5 s for the server to settle, then log in.
+        if (primerMode && !loggedIn) {
+            // Register in primer list — login deferred until !primer fires
+            primerBots.push({ bot: secondaryBot, username, password, queue, alive: () => alive, stopKeepalive, doLogin });
+            console.log(`[Primer] ${username} registered — awaiting primer signal (${primerBots.length} bots ready)`);
+
+            // Check if all expected bots have now spawned and notify super-users
+            checkPrimerReady();
+            return;
+        }
+
+        // Normal (non-primer) flow — log in after 5 s settle time
         setTimeout(() => {
             if (!alive || !secondaryBot?.chat) return;
-
-            queue.send(`/login ${password}`);
-            console.log(`[AllAtOnce] ${username} login queued`);
-
-            // Send /8b8t 3 s after login, then start the keepalive loop.
-            setTimeout(() => {
-                if (!alive || !secondaryBot?.chat) return;
-                queue.send('/8b8t');
-                console.log(`[AllAtOnce] ${username} initial /8b8t queued`);
-                startKeepalive();
-            }, 3000);
-
+            doLogin();
         }, 5000);
     });
-
-    // NOTE: No 'message' event listener here.
-    // Relaying server messages through the primary bot caused spam kicks
-    // on the primary whenever secondary bots received broadcast messages
-    // (e.g. player join/leave announcements). Removed entirely.
 
     secondaryBot.on('error',  (err)    => console.error(`[AllAtOnce] ${username} error:`, err?.message || err));
     secondaryBot.on('kicked', (reason) => { console.log(`[AllAtOnce] ${username} kicked: ${reason}`); handleShutdown(`kicked: ${reason}`); });
@@ -483,15 +602,76 @@ function spawnSecondaryBot(username, password, attempt = 1) {
     return secondaryBot;
 }
 
+// -------------------------------------------------------------------
+// PRIMER: check if all expected secondary bots have spawned
+// -------------------------------------------------------------------
+
+/** Total accounts scheduled in the current !allatonce launch. */
+let primerExpectedCount = 0;
+
 /**
- * Launches all secondary bots (all configured switch + incognito accounts).
- * Staggers connections by ALL_AT_ONCE_STAGGER_MS to avoid flood kicks.
- * A cancel flag is set on the bot list so a mid-sequence !dismiss aborts
- * any remaining queued launches.
- *
+ * Called after each secondary bot spawns in primer mode.
+ * When all expected bots have registered, notifies online super-users.
+ */
+function checkPrimerReady() {
+    if (!primerMode || !primerPending) return;
+    if (primerBots.length < primerExpectedCount) {
+        console.log(`[Primer] ${primerBots.length}/${primerExpectedCount} bots registered — waiting...`);
+        return;
+    }
+
+    console.log(`[Primer] All ${primerBots.length} bots ready — notifying super-users`);
+
+    const supers = getOnlineSuperUsers();
+    if (supers.length === 0) {
+        // Fall back to notifying the requesting user stored in allAtOncePending backup
+        // (already cleared by this point; use broadcast fallback)
+        console.log('[Primer] No super-users online to notify — use !primer to proceed');
+        return;
+    }
+
+    for (const su of supers) {
+        whisperViaPrimary(su, `Primer active. ${primerBots.length} bots waiting. Whisper !primer to deploy.`);
+    }
+}
+
+/**
+ * Fires when !primer is received from a super-user.
+ * Sends /login to ALL primer-pending bots simultaneously (no stagger).
  * @param {string} requestingUser
  */
-function launchAllAtOnce(requestingUser) {
+function executePrimer(requestingUser) {
+    if (!primerPending || primerBots.length === 0) {
+        whisperViaPrimary(requestingUser, 'No primer is currently active.');
+        return;
+    }
+
+    console.log(`[Primer] ${requestingUser} fired primer — logging in ${primerBots.length} bots simultaneously`);
+    primerPending = false;
+    primerMode    = false;
+
+    const snapshot = [...primerBots];
+    primerBots.length = 0;
+
+    // Fire all logins at the exact same moment
+    for (const entry of snapshot) {
+        if (entry.alive()) {
+            entry.doLogin();
+        }
+    }
+
+    whisperViaPrimary(requestingUser, `Primer fired — ${snapshot.length} bots logging in simultaneously.`);
+}
+
+/**
+ * Launches all secondary bots, optionally with PRIMER mode.
+ * Staggers TCP connections to avoid rate limits; PRIMER only defers
+ * the /login calls, not the connections themselves.
+ *
+ * @param {string} requestingUser
+ * @param {boolean} [usePrimer=true]
+ */
+function launchAllAtOnce(requestingUser, usePrimer = true) {
     const accounts = getAllAccountCredentials();
 
     if (accounts.length === 0) {
@@ -499,12 +679,37 @@ function launchAllAtOnce(requestingUser) {
         return;
     }
 
-    const totalSecs = Math.round((accounts.length - 1) * ALL_AT_ONCE_STAGGER_MS / 1000);
-    console.log(`[AllAtOnce] Launching ${accounts.length} bots with ${ALL_AT_ONCE_STAGGER_MS / 1000}s stagger (~${totalSecs}s total)`);
-    safeChat(`/msg ${requestingUser} Launching ${accounts.length} accounts over ~${totalSecs}s. Use !dismiss to stop.`);
+    // If running from a non-DPS_Gemini identity, restore first
+    if (activeMode !== 'normal') {
+        console.log(`[AllAtOnce] Currently running as ${botArgs.username} — restoring DPS_Gemini first`);
+        safeChat(`/msg ${requestingUser} Restoring DPS_Gemini identity before launching all bots...`);
+        botArgs.username = 'DPS_Gemini';
+        currentPassword  = PASSWORD;
+        activeMode       = 'normal';
+        activeIndex      = null;
+        stop8b8tLoop();
+        // Schedule re-launch after reconnect
+        setTimeout(() => launchAllAtOnce(requestingUser, usePrimer), RECONNECT_DELAY + 5000);
+        scheduleReconnect('restore-before-allatonce');
+        return;
+    }
 
-    // Attach a cancel function to the list so dismissAllAtOnce can abort
-    // launches that haven't fired yet.
+    primerMode         = usePrimer;
+    primerPending      = usePrimer;
+    primerExpectedCount = accounts.length;
+    if (usePrimer) primerBots.length = 0;
+
+    const totalSecs = Math.round((accounts.length - 1) * ALL_AT_ONCE_STAGGER_MS / 1000);
+    const modeLabel = usePrimer ? 'PRIMER mode' : 'direct mode';
+
+    console.log(`[AllAtOnce] Launching ${accounts.length} bots (${modeLabel}) with ${ALL_AT_ONCE_STAGGER_MS / 1000}s stagger (~${totalSecs}s total)`);
+
+    if (usePrimer) {
+        safeChat(`/msg ${requestingUser} PRIMER mode: connecting ${accounts.length} accounts over ~${totalSecs}s. Whisper !primer when ready to deploy logins.`);
+    } else {
+        safeChat(`/msg ${requestingUser} Launching ${accounts.length} accounts over ~${totalSecs}s. Use !dismiss to stop.`);
+    }
+
     let cancelled = false;
     allAtOnceBots._cancelLaunch = () => { cancelled = true; };
 
@@ -519,31 +724,27 @@ function launchAllAtOnce(requestingUser) {
 }
 
 /**
- * Disconnects and clears all secondary bots spawned by !allatonce.
- * The primary DPS_Gemini bot is unaffected.
- * Clears the list FIRST so any in-flight retry timeouts see an empty
- * array and abort before spawning new connections.
- *
+ * Disconnects and clears all secondary bots.
+ * Also aborts any pending primer.
  * @param {string} requestingUser
  */
 function dismissAllAtOnce(requestingUser) {
-    // Always clear any pending confirmation first
     allAtOncePending = null;
+    primerPending    = false;
+    primerMode       = false;
+    primerBots.length = 0;
 
-    // Cancel any staggered launches still waiting to fire
     if (typeof allAtOnceBots._cancelLaunch === 'function') {
         allAtOnceBots._cancelLaunch();
     }
 
     if (allAtOnceBots.length === 0) {
-        safeChat(`/msg ${requestingUser} No secondary bots are currently running.`);
+        whisperViaPrimary(requestingUser, 'No secondary bots are currently running.');
         return;
     }
 
     const toQuit = [...allAtOnceBots];
     const count  = toQuit.length;
-
-    // Clear first — retry handlers check this before respawning
     allAtOnceBots = [];
 
     console.log(`[AllAtOnce] Dismissing ${count} secondary bots...`);
@@ -558,31 +759,100 @@ function dismissAllAtOnce(requestingUser) {
     }
 
     console.log('[AllAtOnce] All secondary bots dismissed');
-    safeChat(`/msg ${requestingUser} Done — ${count} secondary bot(s) disconnected.`);
+    whisperViaPrimary(requestingUser, `Done — ${count} secondary bot(s) disconnected.`);
 }
 
-// -------------------------------------------------------------------
-// BAN HELPERS
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 9 — SECONDARY BOT CHAT / WHISPER LISTENERS
+// ===================================================================
 
 /**
- * Parses a duration string like "10m", "2h", "30s", "1d" into milliseconds.
- * Returns null if the format is invalid.
+ * Called when any secondary bot sees a public chat message.
+ * Monitors for super-user commands (!confirm, !dismiss, !primer).
+ *
+ * @param {string} chatUsername
+ * @param {string} message
+ * @param {import('mineflayer').Bot} fromBot
+ */
+function handleSecondaryBotChat(chatUsername, message, fromBot) {
+    if (!chatUsername || !message) return;
+    if (!isSuperUser(chatUsername)) return;
+
+    const { command } = parseIdentityCommand(message.trim());
+    if (!command) return;
+
+    console.log(`[SecondaryBot] Super-user ${chatUsername} sent !${command} in public chat`);
+    routeSuperCommand(chatUsername, command, message, false);
+}
+
+/**
+ * Called when any secondary bot receives a whisper.
+ * Monitors for super-user commands.
+ *
+ * @param {string} wUsername
+ * @param {string} wMessage
+ * @param {import('mineflayer').Bot} fromBot
+ */
+function handleSecondaryBotWhisper(wUsername, wMessage, fromBot) {
+    if (!wUsername || !wMessage) return;
+    if (!isSuperUser(wUsername)) return;
+
+    const { command } = parseIdentityCommand(wMessage.trim());
+    if (!command) return;
+
+    console.log(`[SecondaryBot] Super-user ${wUsername} whispered !${command}`);
+    routeSuperCommand(wUsername, command, wMessage, true);
+}
+
+/**
+ * Routes a super-user command from any bot (primary or secondary).
+ * Prevents double-execution if both primary and secondary bots see
+ * the same public chat message.
+ *
+ * @param {string} username
+ * @param {string} command
+ * @param {string} fullMessage
+ * @param {boolean} isWhisper
+ */
+const recentSuperCommands = new Map(); // `${username}:${command}` -> timestamp
+
+function routeSuperCommand(username, command, fullMessage, isWhisper) {
+    const key = `${username.toLowerCase()}:${command}`;
+    const now = Date.now();
+
+    // Deduplicate — multiple bots may see the same public chat message
+    if (recentSuperCommands.has(key) && now - recentSuperCommands.get(key) < 3000) {
+        console.log(`[SuperCmd] Deduplicated ${key}`);
+        return;
+    }
+    recentSuperCommands.set(key, now);
+
+    // Delegate to the main handler (which already handles these commands)
+    handleRequest(username, fullMessage, isWhisper, null).catch(err => {
+        console.error('[SuperCmd] Error routing super command:', err);
+    });
+}
+
+// ===================================================================
+// SECTION 10 — BAN HELPERS
+// ===================================================================
+
+/**
+ * Parses a duration string like "10m", "2h", "30s", "1d" into ms.
  * @param {string} str
  * @returns {number|null}
  */
 function parseDuration(str) {
     const match = str.trim().match(/^(\d+)([smhd])$/i);
     if (!match) return null;
-    const n           = parseInt(match[1], 10);
-    const unit        = match[2].toLowerCase();
-    const multipliers = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
-    return n * multipliers[unit];
+    const n    = parseInt(match[1], 10);
+    const unit = match[2].toLowerCase();
+    const mults = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+    return n * mults[unit];
 }
 
 /**
  * Human-readable label for a duration string.
- * e.g. "10m" -> "10 minutes"
  * @param {string} str
  * @returns {string}
  */
@@ -592,12 +862,11 @@ function formatDuration(str) {
     const n      = match[1];
     const unit   = match[2].toLowerCase();
     const labels = { s: 'second', m: 'minute', h: 'hour', d: 'day' };
-    const label  = labels[unit];
-    return `${n} ${label}${n === '1' ? '' : 's'}`;
+    return `${n} ${labels[unit]}${n === '1' ? '' : 's'}`;
 }
 
 /**
- * Returns true if the user is currently banned (handles expiry).
+ * Returns true if the user is currently banned.
  * @param {string} username
  * @returns {boolean}
  */
@@ -612,8 +881,7 @@ function isUserBanned(username) {
 }
 
 /**
- * Bans a user for a given duration in milliseconds.
- * Pass Infinity for a permanent ban.
+ * Bans a user for durationMs milliseconds.
  * @param {string} username
  * @param {number} durationMs
  */
@@ -633,8 +901,7 @@ function unbanUser(username) {
 }
 
 /**
- * Returns a human-readable string of how much ban time remains,
- * or null if the ban has expired / doesn't exist.
+ * Returns how much ban time remains, or null if expired / not found.
  * @param {string} username
  * @returns {string|null}
  */
@@ -644,21 +911,19 @@ function banTimeRemaining(username) {
     const expiry = tempBans.get(key);
     if (expiry === Infinity) return 'permanently';
     const ms = expiry - Date.now();
-    if (ms <= 0)             return null;
-    if (ms < 60_000)         return `${Math.ceil(ms / 1000)}s`;
-    if (ms < 3_600_000)      return `${Math.ceil(ms / 60_000)}m`;
-    if (ms < 86_400_000)     return `${Math.ceil(ms / 3_600_000)}h`;
+    if (ms <= 0)        return null;
+    if (ms < 60_000)    return `${Math.ceil(ms / 1000)}s`;
+    if (ms < 3_600_000) return `${Math.ceil(ms / 60_000)}m`;
+    if (ms < 86_400_000) return `${Math.ceil(ms / 3_600_000)}h`;
     return `${Math.ceil(ms / 86_400_000)}d`;
 }
 
-// -------------------------------------------------------------------
-// BAN COMMAND PARSER  (!g ban <user> <duration>  |  !g unban <user>)
-// -------------------------------------------------------------------
+// Ban command regex
 const BAN_REGEX   = /^ban\s+(\S+)\s+(\d+[smhd])$/i;
 const UNBAN_REGEX = /^unban\s+(\S+)$/i;
 
 /**
- * Parses a ban or unban command from user input.
+ * Parses a ban/unban command.
  * @param {string} text
  * @returns {{ type: 'ban', username: string, durationMs: number, durationStr: string }
  *          |{ type: 'unban', username: string }
@@ -676,12 +941,9 @@ function parseBanCommand(text) {
     return null;
 }
 
-// -------------------------------------------------------------------
-// WHISPER QUEUE
-// -------------------------------------------------------------------
-// Whispers from MULTITALK are routed through the primary chat queue,
-// which already handles rate-limiting. This helper exists for call-site
-// clarity and to allow future per-whisper logic if needed.
+// ===================================================================
+// SECTION 11 — WHISPER QUEUE (via primary)
+// ===================================================================
 
 /**
  * Enqueues a batch of whispers through the primary chat queue.
@@ -689,39 +951,29 @@ function parseBanCommand(text) {
  */
 function enqueueWhispers(items) {
     for (const { target, message } of items) {
-        enqueuePrimaryChat(`/msg ${target} ${message}`);
+        enqueuePrimaryChat(`/msg ${target} ${sanitiseChat(message)}`);
     }
 }
 
-// -------------------------------------------------------------------
-// ONLINE PLAYER HELPERS
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 12 — ONLINE PLAYER HELPERS
+// ===================================================================
 
-/** Returns the set of all currently online usernames (exact case). */
-function getOnlinePlayers() {
-    return new Set(onlinePlayers);
-}
-
-/** Returns online players who are verified DPS members. */
-function getOnlineDpsPlayers() {
-    return [...onlinePlayers].filter(name => approvedPlayers.has(name.toLowerCase()));
-}
-
-/** Returns online players who are on the temporary whitelist. */
+function getOnlinePlayers()   { return new Set(onlinePlayers); }
+function getOnlineDpsPlayers() { return [...onlinePlayers].filter(n => approvedPlayers.has(n.toLowerCase())); }
 function getOnlineTempPlayers() {
-    return [...onlinePlayers].filter(name => {
-        const key   = name.toLowerCase();
+    return [...onlinePlayers].filter(n => {
+        const key   = n.toLowerCase();
         const entry = tempWhitelist.get(key);
         return entry && (entry.remaining === Infinity || entry.remaining > 0);
     });
 }
 
-// -------------------------------------------------------------------
-// USER ROLE HELPER
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 13 — USER ROLE HELPER
+// ===================================================================
 
 /**
- * Returns the access role for a given username.
  * @param {string} username
  * @returns {'dps' | 'temp' | 'none'}
  */
@@ -735,15 +987,10 @@ function getUserRole(username) {
     return 'none';
 }
 
-// -------------------------------------------------------------------
-// /8b8t KEEPALIVE LOOP
-// -------------------------------------------------------------------
-// 8b8t kicks idle bots. Sending /8b8t every 2 minutes keeps the session
-// alive. All sends go through the primary chat queue.
+// ===================================================================
+// SECTION 14 — 8b8t KEEPALIVE LOOP
+// ===================================================================
 
-let eightb8tInterval = null;
-
-/** Starts the /8b8t keepalive loop. Safe to call multiple times. */
 function start8b8tLoop() {
     if (eightb8tInterval) clearInterval(eightb8tInterval);
     eightb8tInterval = setInterval(() => {
@@ -755,7 +1002,6 @@ function start8b8tLoop() {
     console.log('[8b8t] Loop started');
 }
 
-/** Stops the /8b8t keepalive loop. */
 function stop8b8tLoop() {
     if (eightb8tInterval) {
         clearInterval(eightb8tInterval);
@@ -764,14 +1010,9 @@ function stop8b8tLoop() {
     }
 }
 
-// -------------------------------------------------------------------
-// MEMORY WATCHDOG
-// -------------------------------------------------------------------
-// If the process heap exceeds MEMORY_LIMIT_MB, clears all runtime state
-// and triggers a clean reconnect to free memory.
-
-const MEMORY_CHECK_INTERVAL = 60 * 1000;
-const MEMORY_LIMIT_MB       = 400;
+// ===================================================================
+// SECTION 15 — MEMORY WATCHDOG
+// ===================================================================
 
 setInterval(() => {
     const used = process.memoryUsage().heapUsed / 1024 / 1024;
@@ -782,7 +1023,6 @@ setInterval(() => {
     }
 }, MEMORY_CHECK_INTERVAL);
 
-/** Clears all runtime state and schedules a reconnect. */
 function gracefulRestart() {
     userCooldowns.clear();
     userConversations.clear();
@@ -797,13 +1037,13 @@ function gracefulRestart() {
     scheduleReconnect('memory-pressure');
 }
 
-// -------------------------------------------------------------------
-// PERIODIC CLEANUP
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 16 — PERIODIC CLEANUP
+// ===================================================================
+
 setInterval(() => {
     const now = Date.now();
 
-    // Expire finished bans
     for (const [key, expiry] of tempBans.entries()) {
         if (expiry !== Infinity && now >= expiry) {
             tempBans.delete(key);
@@ -811,14 +1051,12 @@ setInterval(() => {
         }
     }
 
-    // Trim stale cooldown windows
     for (const [user, timestamps] of userCooldowns.entries()) {
         const fresh = timestamps.filter(ts => now - ts < TIME_WINDOW);
         if (fresh.length === 0) userCooldowns.delete(user);
         else userCooldowns.set(user, fresh);
     }
 
-    // Evict oldest conversation histories if over cap
     while (userConversations.size > MAX_USERS_TRACKED) {
         const oldest = userConversations.keys().next().value;
         userConversations.delete(oldest);
@@ -829,14 +1067,19 @@ setInterval(() => {
         console.warn('[Cleanup] pendingRequests exceeded cap — cleared');
     }
 
-    console.log(`[Cleanup] cooldowns:${userCooldowns.size} conversations:${userConversations.size} pending:${pendingRequests.size} tempWL:${tempWhitelist.size} bans:${tempBans.size}`);
+    // Prune old deduplicated super-command entries
+    const superCmdCutoff = now - 10_000;
+    for (const [k, ts] of recentSuperCommands.entries()) {
+        if (ts < superCmdCutoff) recentSuperCommands.delete(k);
+    }
+
+    console.log(`[Cleanup] cooldowns:${userCooldowns.size} conversations:${userConversations.size} pending:${pendingRequests.size} tempWL:${tempWhitelist.size} bans:${tempBans.size} primerBots:${primerBots.length}`);
 }, 5 * 60 * 1000);
 
-// -------------------------------------------------------------------
-// APPROVED PLAYERS
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 17 — APPROVED PLAYERS
+// ===================================================================
 
-/** Loads approved_players.txt into the approvedPlayers set. */
 function loadApprovedPlayers() {
     try {
         const data = fs.readFileSync('approved_players.txt', 'utf8');
@@ -854,7 +1097,6 @@ function loadApprovedPlayers() {
 
 /**
  * Decrements a temp-whitelist user's remaining uses.
- * Removes the entry when uses reach zero.
  * @param {string} username
  */
 function consumeTempWhitelistUse(username) {
@@ -872,15 +1114,10 @@ function consumeTempWhitelistUse(username) {
     }
 }
 
-// -------------------------------------------------------------------
-// DPS NEWS
-// -------------------------------------------------------------------
-const DPS_NEWS_PATH = 'dps_news.txt';
+// ===================================================================
+// SECTION 18 — DPS NEWS
+// ===================================================================
 
-/**
- * Reads dps_news.txt and returns its contents, or null on failure.
- * @returns {string|null}
- */
 function loadDpsNews() {
     try {
         return fs.readFileSync(DPS_NEWS_PATH, 'utf8').trim() || null;
@@ -890,22 +1127,17 @@ function loadDpsNews() {
     }
 }
 
-// The exact string Gemini returns to signal a DPS news lookup is needed.
-const GATHERING_DATA_REGEX = /^\s*Gathering Data\.{3}\s*$/i;
-
-/** @param {string} text */
 function isGatheringData(text) { return GATHERING_DATA_REGEX.test(text); }
 
-// -------------------------------------------------------------------
-// COMMAND PARSERS
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 19 — COMMAND PARSERS
+// ===================================================================
 
 // {TALK}{W}{username}{message}  — whisper a specific player
 // {TALK}{C}{message}            — send to public chat
 const TALK_REGEX = /\{TALK\}\{([WwCc])\}(?:\{([^}]+)\})?\{([^}]+)\}/;
 
 /**
- * Parses a TALK command from Gemini's response.
  * @param {string} text
  * @returns {{ mode: 'W', target: string, message: string }
  *          |{ mode: 'C', message: string }
@@ -933,7 +1165,6 @@ function parseTalkCommand(text) {
 const WHITETEMP_REGEX = /\{WHITETEMP\}\{([^}]+)\}\{([^}]+)\}/;
 
 /**
- * Parses a WHITETEMP command from Gemini's response.
  * @param {string} text
  * @returns {{ username: string, remaining: number | typeof Infinity } | null}
  */
@@ -953,7 +1184,6 @@ function parseWhiteTempCommand(text) {
 const REVOKE_REGEX = /\{REVOKE\}\{([^}]+)\}/;
 
 /**
- * Parses a REVOKE command from Gemini's response.
  * @param {string} text
  * @returns {{ username: string } | null}
  */
@@ -968,7 +1198,6 @@ function parseRevokeCommand(text) {
 const MULTITALK_REGEX = /\{MULTITALK\}\{([^}]+)\}\{([^}]+)\}/;
 
 /**
- * Parses a MULTITALK command from Gemini's response.
  * @param {string} text
  * @returns {{ targets: string[], message: string } | null}
  */
@@ -983,7 +1212,6 @@ function parseMultiTalkCommand(text) {
 
 /**
  * Returns true if the text contains an admin-only command.
- * TALK is intentionally excluded — it is open to all roles.
  * @param {string} text
  * @returns {boolean}
  */
@@ -991,26 +1219,21 @@ function containsAdminCommand(text) {
     return WHITETEMP_REGEX.test(text) || REVOKE_REGEX.test(text);
 }
 
-// -------------------------------------------------------------------
-// TRIGGER DETECTION
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 20 — TRIGGER DETECTION
+// ===================================================================
+
 const TRIGGER_REGEX = /(?:^|>)\s*!g(?:emini)?,?\b/i;
 
-/** @param {string} text */
 function hasTrigger(text)   { return TRIGGER_REGEX.test(text); }
-
-/** @param {string} text */
 function stripTrigger(text) { return text.replace(/(?:^|>)\s*!g(?:emini)?,?\s*/gi, '').trim(); }
 
-// -------------------------------------------------------------------
-// COMPONENT TREE HELPERS
-// -------------------------------------------------------------------
-// Minecraft sends chat as nested JSON component trees. These helpers
-// extract plain text, click events (for real usernames), and hover
-// stats from those trees.
+// ===================================================================
+// SECTION 21 — COMPONENT TREE HELPERS
+// ===================================================================
 
 /**
- * Recursively extracts plain text from a chat component tree.
+ * Recursively extracts plain text from a Minecraft chat component tree.
  * @param {object|string} component
  * @returns {string}
  */
@@ -1024,8 +1247,7 @@ function componentToPlainText(component) {
 
 /**
  * Walks a component tree looking for a suggest_command clickEvent
- * whose value starts with /msg (used to extract the real username
- * from server-formatted chat messages).
+ * with a /msg value (to extract real username).
  * @param {object} component
  * @returns {string|null}
  */
@@ -1047,10 +1269,9 @@ function findClickEventValue(component) {
 }
 
 /**
- * Walks a component tree looking for hover stats (lang, time played,
- * kills, deaths) embedded in show_text hover events.
+ * Walks a component tree looking for hover stats (lang, timePlayed, kills, deaths).
  * @param {object} component
- * @returns {{ lang: string|null, timePlayed: string|null, kills: string|null, deaths: string|null } | null}
+ * @returns {{ lang, timePlayed, kills, deaths } | null}
  */
 function findHoverStats(component) {
     if (!component || typeof component !== 'object') return null;
@@ -1077,8 +1298,7 @@ function findHoverStats(component) {
 }
 
 /**
- * Attempts to parse a raw packet data object into a structured chat event.
- * Returns null if no click event (real username) could be found.
+ * Attempts to parse raw packet data into a structured chat event.
  * @param {object} data
  * @returns {{ realUsername: string, plainText: string, hoverStats: object|null } | null}
  */
@@ -1101,11 +1321,9 @@ function parsePacket(data) {
     return null;
 }
 
-// -------------------------------------------------------------------
-// WHISPER EXTRACTION
-// -------------------------------------------------------------------
-// Whispers can arrive in several formats depending on server version
-// and plugin. All known patterns are tried in order.
+// ===================================================================
+// SECTION 22 — WHISPER EXTRACTION
+// ===================================================================
 
 const WHISPER_PATTERNS = [
     /^(\w+)\s+whispers(?:\s+to\s+you)?:\s*(.+)$/i,
@@ -1137,12 +1355,12 @@ function parseWhisperPacket(data) {
     return null;
 }
 
-// -------------------------------------------------------------------
-// BOT INITIALIZATION
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 23 — BOT INITIALIZATION
+// ===================================================================
+
 loadApprovedPlayers();
 
-/** Creates the primary mineflayer bot and attaches all event handlers. */
 function createBot() {
     try {
         bot = mineflayer.createBot(botArgs);
@@ -1154,41 +1372,34 @@ function createBot() {
     }
 }
 
-/** Attaches all event listeners to the current bot instance. */
+// ===================================================================
+// SECTION 24 — BOT EVENT SETUP
+// ===================================================================
+
 function setupBotEvents() {
     bot.once('spawn', () => {
         botReady = false;
         console.log('[Bot] Spawned, waiting for chat readiness...');
         reconnectAttempts = 0;
 
-        // Seed the online player list from whoever is already visible.
         onlinePlayers.clear();
         for (const username of Object.keys(bot.players || {})) {
             if (username !== bot.username) onlinePlayers.add(username);
         }
         console.log(`[Players] Seeded ${onlinePlayers.size} online players`);
 
-        // Send login command after the server has settled.
         const tryLogin = () => {
             if (bot?.chat) {
                 try {
-                    // Route through the queue so login doesn't race with
-                    // any already-queued messages from before reconnect.
                     enqueuePrimaryChat(`/login ${currentPassword}`);
                     console.log('[Bot] Login queued');
-
-                    // Start 8b8t keepalive 10 s after login.
                     setTimeout(start8b8tLoop, 10000);
-
-                    // Mark bot as fully ready 5 s after login.
-                    // This prevents command handling before auth completes.
                     setTimeout(() => {
                         if (bot && bot._client) {
                             botReady = true;
                             console.log('[Bot] Ready state: true');
                         }
                     }, 5000);
-
                 } catch (err) {
                     console.error('[Error] Login failed, retrying...', err.message);
                     setTimeout(tryLogin, 3000);
@@ -1198,17 +1409,39 @@ function setupBotEvents() {
             }
         };
 
-        // Wait 5 s before the first login attempt.
         setTimeout(tryLogin, 5000);
     });
 
     // ── PACKET HANDLER ────────────────────────────────────────────
-    // Intercepts raw chat packets to extract real usernames (which the
-    // high-level mineflayer events sometimes mangle) and hover stats.
     const packetHandler = (data, meta) => {
         try {
             const chatPackets = ['chat', 'player_chat', 'system_chat', 'profileless_chat'];
             if (!chatPackets.includes(meta.name)) return;
+
+            // ── SUPER-USER BARE COMMANDS (no !g prefix needed) ────
+            // Check for super-user commands first, before any other processing.
+            // This allows !confirm, !dismiss, !primer, etc. without !g prefix.
+            const rawTextForSuper = extractPlainTextFromData(data);
+            if (rawTextForSuper) {
+                const strippedRaw   = rawTextForSuper.replace(/^\[[^\]]+\]\s*/g, '').replace(/^<[^>]+>\s*/g, '').trim();
+                const usernameFromPacket = tryExtractSenderFromPacket(data);
+
+                if (usernameFromPacket && isSuperUser(usernameFromPacket)) {
+                    const { command } = parseIdentityCommand(strippedRaw);
+                    if (command) {
+                        const dedupeKey = `${usernameFromPacket.toLowerCase()}:${command}`;
+                        const now = Date.now();
+                        if (!recentSuperCommands.has(dedupeKey) || now - recentSuperCommands.get(dedupeKey) > 3000) {
+                            recentSuperCommands.set(dedupeKey, now);
+                            console.log(`[SuperCmd/packet] ${usernameFromPacket} issued !${command} (no prefix)`);
+                            handleRequest(usernameFromPacket, strippedRaw, false, null).catch(err => {
+                                console.error('[SuperCmd/packet] Error:', err);
+                            });
+                        }
+                        return;
+                    }
+                }
+            }
 
             // ── WHISPER FLOW ──────────────────────────────────────
             const whisper = parseWhisperPacket(data);
@@ -1218,7 +1451,6 @@ function setupBotEvents() {
 
                 console.log(`[Whisper/packet] ${realUsername}: ${message}`);
 
-                // Mark as handled; cancel any existing timer for this user.
                 if (handledByPacket.has(realUsername)) clearTimeout(handledByPacket.get(realUsername));
                 const timer = setTimeout(() => handledByPacket.delete(realUsername), HANDLED_PACKET_TTL);
                 handledByPacket.set(realUsername, timer);
@@ -1234,7 +1466,6 @@ function setupBotEvents() {
             const { realUsername, plainText, hoverStats } = parsed;
             if (realUsername === bot?.username) return;
 
-            // Strip leading rank/bracket prefixes then check for trigger
             const cleanText = plainText
                 .replace(/^\[[^\]]+\]\s*/g, '')
                 .replace(/^<[^>]+>\s*/g, '')
@@ -1261,7 +1492,6 @@ function setupBotEvents() {
     bot._packetHandler = packetHandler;
 
     // ── NATIVE WHISPER FALLBACK ───────────────────────────────────
-    // Only fires if the packet handler didn't already handle this whisper.
     bot.on('whisper', (username, message) => {
         try {
             if (handledByPacket.has(username)) {
@@ -1282,6 +1512,7 @@ function setupBotEvents() {
         console.log('[Kicked]', reason);
         botReady = false;
         stop8b8tLoop();
+        // DPS_Gemini must always reconnect unless we explicitly switched identity
         scheduleReconnect('kicked');
     });
 
@@ -1290,6 +1521,7 @@ function setupBotEvents() {
         botReady = false;
         stop8b8tLoop();
         onlinePlayers.clear();
+        // DPS_Gemini always reconnects
         scheduleReconnect('disconnected');
     });
 
@@ -1308,12 +1540,71 @@ function setupBotEvents() {
     });
 }
 
-// -------------------------------------------------------------------
-// RECONNECT SCHEDULER
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 25 — PACKET TEXT EXTRACTION HELPERS
+// ===================================================================
 
 /**
- * Schedules a reconnect attempt with exponential backoff (capped at 5 min).
+ * Attempts to extract plain text from raw packet data without requiring
+ * a click event (used for super-user command detection).
+ * @param {object} data
+ * @returns {string|null}
+ */
+function extractPlainTextFromData(data) {
+    const candidates = [data.message, data.signedChat, data.unsignedContent, data.chatMessage, data.data, data.content];
+    for (const raw of candidates) {
+        if (!raw) continue;
+        let component;
+        try { component = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { continue; }
+        if (typeof component !== 'object' || component === null) {
+            if (typeof raw === 'string') return raw;
+            continue;
+        }
+        const text = componentToPlainText(component);
+        if (text) return text;
+    }
+    return null;
+}
+
+/**
+ * Attempts to extract the sender's username from a chat packet
+ * without requiring a click event. Falls back to null.
+ * @param {object} data
+ * @returns {string|null}
+ */
+function tryExtractSenderFromPacket(data) {
+    // Try click event first (most reliable)
+    const candidates = [data.message, data.signedChat, data.unsignedContent, data.chatMessage, data.data, data.content];
+    for (const raw of candidates) {
+        if (!raw) continue;
+        let component;
+        try { component = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { continue; }
+        if (typeof component !== 'object' || component === null) continue;
+        const clickVal = findClickEventValue(component);
+        if (clickVal) return clickVal.replace(/^\/msg\s+/, '').trim();
+    }
+
+    // Try to extract from plain text format like "<username> message" or "[rank] username: msg"
+    const plain = extractPlainTextFromData(data);
+    if (!plain) return null;
+
+    const angleMatch = plain.match(/^<(\w+)>/);
+    if (angleMatch) return angleMatch[1];
+
+    // "[RANK] Username: message" format
+    const rankMatch = plain.match(/^\[[^\]]*\]\s*(\w+)/);
+    if (rankMatch) return rankMatch[1];
+
+    return null;
+}
+
+// ===================================================================
+// SECTION 26 — RECONNECT SCHEDULER
+// ===================================================================
+
+/**
+ * Schedules a reconnect with exponential backoff (capped at 5 min).
+ * Ensures DPS_Gemini always comes back online.
  * @param {string} [reason='unknown']
  */
 function scheduleReconnect(reason = 'unknown') {
@@ -1323,7 +1614,6 @@ function scheduleReconnect(reason = 'unknown') {
     reconnecting = true;
     reconnectAttempts++;
 
-    // Use (attempts - 1) so the first retry uses the base delay unchanged.
     const delay = Math.min(300_000, RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts - 1));
     console.log(`[Reconnect] Attempt ${reconnectAttempts} in ${Math.round(delay / 1000)}s (reason: ${reason})`);
 
@@ -1342,20 +1632,23 @@ function scheduleReconnect(reason = 'unknown') {
             console.error('[Reconnect] Cleanup error (non-fatal):', cleanupErr.message);
         }
         bot = null;
+
+        // Always reconnect — DPS_Gemini must stay online
+        console.log(`[Reconnect] Reconnecting as ${botArgs.username}...`);
         createBot();
     }, delay);
 }
 
-// -------------------------------------------------------------------
-// SYSTEM PROMPT
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 27 — SYSTEM PROMPT BUILDER
+// ===================================================================
 
 /**
  * Builds the Gemini system prompt for a given user and context.
  *
  * @param {string} username
  * @param {object|null} hoverStats
- * @param {string|null} newsContext - if set, the DPS news data to inject
+ * @param {string|null} newsContext
  * @param {'dps'|'temp'} userRole
  * @returns {string}
  */
@@ -1446,14 +1739,13 @@ After any command executes, the bot confirms to the requesting user automaticall
     return prompt;
 }
 
-// -------------------------------------------------------------------
-// CORE HANDLER
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 28 — CORE HANDLER
+// ===================================================================
 
 /**
  * Entry point for all incoming requests (whispers and public chat).
- * Handles identity commands, role checks, ban checks, and delegates
- * to processRequest for AI handling.
+ * Super-user identity commands are handled here; role/ban checks follow.
  *
  * @param {string} username
  * @param {string} message
@@ -1463,55 +1755,58 @@ After any command executes, the bot confirms to the requesting user automaticall
 async function handleRequest(username, message, isWhisper, hoverStats = null) {
     if (!username || !message) return;
 
-    // ── IDENTITY / SUPER-USER COMMANDS ────────────────────────────
-    // Intercepted before role/ban checks so super-user controls always
-    // reach the gate regardless of whitelist state.
-    const { command: identCmd } = parseIdentityCommand(message.trim());
+    // ── SUPER-USER IDENTITY / CONTROL COMMANDS ────────────────────
+    // These work WITHOUT !g prefix and WITHOUT bot readiness.
+    // Checked first, before role, ban, or readiness gates.
+    const { command: identCmd, rest: identRest } = parseIdentityCommand(message.trim());
     if (identCmd) {
         if (!isSuperUser(username)) {
-            // Silently ignore — don't reveal the feature exists to randos.
             console.log(`[Identity] ${username} tried !${identCmd} — not a super user, ignoring`);
             return;
         }
 
+        // ── !switch ──────────────────────────────────────────────
         if (identCmd === 'switch') {
-            const n = Math.floor(Math.random() * 5) + 1; // slot 1–5
+            // Parse optional slot number, e.g. "!switch 3"
+            const slotNum = parseInt(identRest, 10);
+            const n       = (!isNaN(slotNum) && slotNum >= 1 && slotNum <= 5) ? slotNum : (Math.floor(Math.random() * 5) + 1);
             switchIdentity('switch', n, username);
             return;
         }
 
+        // ── !incognito ───────────────────────────────────────────
         if (identCmd === 'incognito') {
-            const n = Math.floor(Math.random() * 8) + 1; // slot 1–8
+            const slotNum = parseInt(identRest, 10);
+            const n       = (!isNaN(slotNum) && slotNum >= 1 && slotNum <= 8) ? slotNum : (Math.floor(Math.random() * 8) + 1);
             switchIdentity('incognito', n, username);
             return;
         }
 
+        // ── !normal ──────────────────────────────────────────────
         if (identCmd === 'normal') {
-            if (activeMode === 'normal') {
-                safeChat(`/msg ${username} Already running as the normal identity.`);
-                return;
-            }
-            botArgs.username = 'DPS_Gemini';
-            currentPassword  = PASSWORD;
-            activeMode       = 'normal';
-            activeIndex      = null;
-            console.log(`[Identity] ${username} restored normal identity`);
-            safeChat(`/msg ${username} Reverting to normal identity... reconnecting.`);
-            stop8b8tLoop();
-            scheduleReconnect('identity-switch-to-normal');
+            restoreNormalIdentity(username);
             return;
         }
 
+        // ── !allatonce ───────────────────────────────────────────
         if (identCmd === 'allatonce') {
             if (allAtOnceBots.length > 0) {
-                safeChat(`/msg ${username} Secondary bots are already running. Use !dismiss first.`);
+                whisperViaPrimary(username, 'Secondary bots are already running. Use !dismiss first.');
                 return;
             }
-            allAtOncePending = username;
-            console.log(`[AllAtOnce] ${username} requested !allatonce — awaiting !confirm`);
-            safeChat(`/msg ${username} Are you sure? This will log ALL accounts onto the server simultaneously. Whisper !confirm to proceed, or ignore to cancel.`);
 
-            // Auto-expire the pending state after 60 s
+            // Parse optional NOPRIMER flag
+            const noPrimer = /\bNOPRIMER\b/i.test(identRest);
+            const usePrimer = !noPrimer; // PRIMER is ON by default
+
+            allAtOncePending = username;
+            const primerLabel = usePrimer ? ' with PRIMER (default)' : ' WITHOUT primer (NOPRIMER flag set)';
+            console.log(`[AllAtOnce] ${username} requested !allatonce${primerLabel} — awaiting !confirm`);
+            whisperViaPrimary(username, `Launch ALL accounts${primerLabel}? Whisper !confirm to proceed, or ignore to cancel.`);
+
+            // Store primer preference on the pending state
+            allAtOncePrimer = usePrimer;
+
             setTimeout(() => {
                 if (allAtOncePending === username) {
                     allAtOncePending = null;
@@ -1521,36 +1816,43 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
             return;
         }
 
+        // ── !confirm ─────────────────────────────────────────────
         if (identCmd === 'confirm') {
             if (allAtOncePending === null) {
-                safeChat(`/msg ${username} No pending !allatonce to confirm.`);
+                whisperViaPrimary(username, 'No pending !allatonce to confirm.');
                 return;
             }
             if (allAtOncePending !== username) {
-                safeChat(`/msg ${username} You didn't initiate !allatonce — only ${allAtOncePending} can confirm it.`);
+                whisperViaPrimary(username, `You didn't initiate !allatonce — only ${allAtOncePending} can confirm it.`);
                 return;
             }
+            const usePrimer = allAtOncePrimer !== false; // default true
             allAtOncePending = null;
-            console.log(`[AllAtOnce] ${username} confirmed — launching all bots`);
-            launchAllAtOnce(username);
+            allAtOncePrimer  = null;
+            console.log(`[AllAtOnce] ${username} confirmed — launching all bots (primer: ${usePrimer})`);
+            launchAllAtOnce(username, usePrimer);
             return;
         }
 
+        // ── !dismiss ─────────────────────────────────────────────
         if (identCmd === 'dismiss') {
             dismissAllAtOnce(username);
+            return;
+        }
+
+        // ── !primer ──────────────────────────────────────────────
+        if (identCmd === 'primer') {
+            executePrimer(username);
             return;
         }
     }
 
     // ── BOT READINESS GATE ────────────────────────────────────────
-    // Checked after identity commands so super-user controls still work
-    // during reconnect windows.
     if (!bot || !botReady || !bot.chat || !bot._client) {
         console.log(`[Blocked] Bot not ready — dropping request from ${username}`);
         return;
     }
 
-    // Guard against self-messages
     if (username === bot.username) return;
 
     // ── ROLE CHECK ────────────────────────────────────────────────
@@ -1575,7 +1877,7 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
         return;
     }
 
-    // ── BAN / UNBAN COMMAND (DPS only, before AI) ─────────────────
+    // ── BAN / UNBAN COMMAND (DPS only) ────────────────────────────
     if (role === 'dps') {
         const banCmd = parseBanCommand(prompt);
         if (banCmd) {
@@ -1583,16 +1885,16 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
                 banUser(banCmd.username, banCmd.durationMs);
                 const label = formatDuration(banCmd.durationStr);
                 console.log(`[Ban] ${username} banned ${banCmd.username} for ${label}`);
-                safeChat(`/msg ${username} Done — ${banCmd.username} is banned for ${label}.`);
-                safeChat(`/msg ${banCmd.username} You have been banned from using this bot for ${label}.`);
+                whisperViaPrimary(username, `Done — ${banCmd.username} is banned for ${label}.`);
+                whisperViaPrimary(banCmd.username, `You have been banned from using this bot for ${label}.`);
             } else {
                 const wasFound = unbanUser(banCmd.username);
                 if (wasFound) {
                     console.log(`[Ban] ${username} unbanned ${banCmd.username}`);
-                    safeChat(`/msg ${username} Done — ${banCmd.username} has been unbanned.`);
-                    safeChat(`/msg ${banCmd.username} You have been unbanned from using this bot.`);
+                    whisperViaPrimary(username, `Done — ${banCmd.username} has been unbanned.`);
+                    whisperViaPrimary(banCmd.username, 'You have been unbanned from using this bot.');
                 } else {
-                    safeChat(`/msg ${username} ${banCmd.username} isn't currently banned.`);
+                    whisperViaPrimary(username, `${banCmd.username} isn't currently banned.`);
                 }
             }
             return;
@@ -1616,9 +1918,12 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
     }
 }
 
-// -------------------------------------------------------------------
-// REQUEST PROCESSOR
-// -------------------------------------------------------------------
+// Companion mutable for primer preference stored during !allatonce pending
+let allAtOncePrimer = null;
+
+// ===================================================================
+// SECTION 29 — REQUEST PROCESSOR
+// ===================================================================
 
 /**
  * Handles rate limiting, calls the Gemini API, and dispatches the response.
@@ -1633,8 +1938,8 @@ async function processRequest(username, prompt, isWhisper, hoverStats, role) {
     const isExempt = username.toLowerCase() === 'freddison';
 
     if (!isExempt) {
-        const now        = Date.now();
-        let timestamps   = (userCooldowns.get(username) || []).filter(ts => now - ts < TIME_WINDOW);
+        const now      = Date.now();
+        let timestamps = (userCooldowns.get(username) || []).filter(ts => now - ts < TIME_WINDOW);
         if (timestamps.length >= MSG_LIMIT) {
             const wait = Math.ceil((TIME_WINDOW - (now - timestamps[0])) / 1000);
             safeChat(`/msg ${username} Quota reached (${MSG_LIMIT} msgs/${TIME_WINDOW / 60000}min). Wait ${wait}s.`);
@@ -1692,13 +1997,14 @@ async function processRequest(username, prompt, isWhisper, hoverStats, role) {
     await dispatchResponse(firstResponse, username, isWhisper, role);
 }
 
-// -------------------------------------------------------------------
-// RESPONSE DISPATCHER
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 30 — RESPONSE DISPATCHER
+// ===================================================================
 
 /**
- * Parses Gemini's raw response for special commands and executes them,
- * or sends the text directly to the requesting user.
+ * Parses Gemini's raw response for special commands and executes them.
+ * TALK, MULTITALK events are broadcast through ALL active bots.
+ * AI text responses are sent through ONE random bot.
  *
  * @param {string} rawResponse
  * @param {string} senderUsername
@@ -1709,7 +2015,6 @@ async function dispatchResponse(rawResponse, senderUsername, isWhisper, role = '
     const text = rawResponse.trim();
 
     // ── ADMIN COMMAND GATE ────────────────────────────────────────
-    // Temp users must never be able to execute whitelist or revoke commands.
     if (role !== 'dps' && containsAdminCommand(text)) {
         console.warn(`[Gate] Temp user ${senderUsername} attempted an admin command — blocked.`);
         safeChat(`/msg ${senderUsername} Whitelist and revoke commands are restricted to DPS members only.`);
@@ -1727,12 +2032,14 @@ async function dispatchResponse(rawResponse, senderUsername, isWhisper, role = '
 
         if (talkCmd.mode === 'W') {
             console.log(`[TALK/W] ${senderUsername} -> whisper ${talkCmd.target}: ${talkCmd.message}`);
-            safeChat(`/msg ${talkCmd.target} ${talkCmd.message}`);
-            safeChat(`/msg ${senderUsername} Done — whispered to ${talkCmd.target}.`);
+            // Whisper broadcast through ALL bots
+            broadcastAllBots(`/msg ${talkCmd.target} ${talkCmd.message}`);
+            whisperViaPrimary(senderUsername, `Done — whispered to ${talkCmd.target} from all bots.`);
         } else if (talkCmd.mode === 'C') {
             console.log(`[TALK/C] ${senderUsername} -> public: ${talkCmd.message}`);
-            safeChat(talkCmd.message);
-            safeChat(`/msg ${senderUsername} Done — sent to public chat.`);
+            // Public chat broadcast through ALL bots
+            broadcastAllBots(talkCmd.message);
+            whisperViaPrimary(senderUsername, 'Done — sent to public chat from all bots.');
         }
 
         if (afterTalk) sendSmartChat(afterTalk, senderUsername, isWhisper);
@@ -1744,8 +2051,11 @@ async function dispatchResponse(rawResponse, senderUsername, isWhisper, role = '
     const multiCmd = parseMultiTalkCommand(text);
     if (multiCmd) {
         console.log(`[MULTITALK] ${senderUsername} -> ${multiCmd.targets.join(', ')}: ${multiCmd.message}`);
-        enqueueWhispers(multiCmd.targets.map(t => ({ target: t, message: multiCmd.message })));
-        safeChat(`/msg ${senderUsername} Done — messaged ${multiCmd.targets.length} players.`);
+        // Send through ALL bots
+        for (const target of multiCmd.targets) {
+            broadcastAllBots(`/msg ${target} ${multiCmd.message}`);
+        }
+        whisperViaPrimary(senderUsername, `Done — messaged ${multiCmd.targets.length} players from all bots.`);
         consumeTempWhitelistUse(senderUsername);
         return;
     }
@@ -1759,7 +2069,7 @@ async function dispatchResponse(rawResponse, senderUsername, isWhisper, role = '
             ? 'unlimited access (this session)'
             : `${wtCmd.remaining} message(s) (this session)`;
         console.log(`[WHITETEMP] ${senderUsername} whitelisted ${wtCmd.username} for ${label}`);
-        safeChat(`/msg ${senderUsername} Done — ${wtCmd.username} whitelisted for ${label}.`);
+        whisperViaPrimary(senderUsername, `Done — ${wtCmd.username} whitelisted for ${label}.`);
         consumeTempWhitelistUse(senderUsername);
         return;
     }
@@ -1771,26 +2081,26 @@ async function dispatchResponse(rawResponse, senderUsername, isWhisper, role = '
         if (tempWhitelist.has(key)) {
             tempWhitelist.delete(key);
             console.log(`[REVOKE] ${senderUsername} revoked access for ${revokeCmd.username}`);
-            safeChat(`/msg ${senderUsername} Done — ${revokeCmd.username} removed from the temp whitelist.`);
+            whisperViaPrimary(senderUsername, `Done — ${revokeCmd.username} removed from the temp whitelist.`);
         } else {
-            safeChat(`/msg ${senderUsername} ${revokeCmd.username} isn't on the temp whitelist.`);
+            whisperViaPrimary(senderUsername, `${revokeCmd.username} isn't on the temp whitelist.`);
         }
         consumeTempWhitelistUse(senderUsername);
         return;
     }
 
-    // ── Normal text response ──────────────────────────────────────
-    sendSmartChat(text, senderUsername, isWhisper);
+    // ── Normal text response — send through a RANDOM bot ─────────
+    sendSmartChatRandom(text, senderUsername, isWhisper);
     consumeTempWhitelistUse(senderUsername);
 }
 
-// -------------------------------------------------------------------
-// HISTORY MANAGEMENT
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 31 — HISTORY MANAGEMENT
+// ===================================================================
 
 /**
  * Appends a user+assistant exchange to conversation history.
- * Keeps the last 3 full exchanges (6 entries) to balance context vs memory.
+ * Keeps the last 3 full exchanges (6 entries).
  *
  * @param {string} username
  * @param {string} userPrompt
@@ -1806,18 +2116,16 @@ function commitHistory(username, userPrompt, assistantReply) {
     history.push({ role: 'user',      content: userPrompt    });
     history.push({ role: 'assistant', content: assistantReply });
 
-    // Keep last 3 exchanges (6 entries = 3 user + 3 assistant).
     if (history.length > 6) history.splice(0, history.length - 6);
-
     userConversations.set(username, history);
 }
 
-// -------------------------------------------------------------------
-// GEMINI API CALL
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 32 — GEMINI API CALL
+// ===================================================================
 
 /**
- * Calls the Gemini API with the current conversation history.
+ * Calls the Gemini API with current conversation history.
  * Retries up to MAX_RETRIES times on transient errors.
  *
  * @param {string} username
@@ -1883,14 +2191,12 @@ async function callGemini(username, history, hoverStats = null, newsContext = nu
     }
 }
 
-// -------------------------------------------------------------------
-// CHAT OUTPUT
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 33 — CHAT OUTPUT HELPERS
+// ===================================================================
 
 /**
- * Sends a response to a user, splitting into chunks if needed.
- * All sends go through the primary chat queue.
- *
+ * Sends a response via the primary bot (for confirmations, errors, etc.).
  * @param {string} text
  * @param {string} targetUser
  * @param {boolean} isWhisper
@@ -1922,9 +2228,59 @@ function sendSmartChat(text, targetUser, isWhisper) {
 }
 
 /**
- * Splits a long string into chunks no longer than maxLength,
- * preferring sentence boundaries then word boundaries.
- * Hard-cuts individual words that exceed maxLength.
+ * Sends an AI response via a RANDOM active bot.
+ * This is used for all Gemini text replies so responses appear to come
+ * from different bots, adding variety/presence to the fleet.
+ *
+ * @param {string} text
+ * @param {string} targetUser
+ * @param {boolean} isWhisper
+ */
+function sendSmartChatRandom(text, targetUser, isWhisper) {
+    if (!text) return;
+    try {
+        const cleanText = text
+            .replace(/\n+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .replace(/[*_`#]/g, '')
+            .trim();
+        if (!cleanText) return;
+
+        const prefix = `/msg ${targetUser} `;
+        const limit  = 256 - prefix.length - 5;
+
+        const chosen = getRandomBot();
+
+        const sendChunk = (chunk) => {
+            const full = sanitiseChat(`${prefix}${chunk}`);
+            if (!full) return;
+
+            if (!chosen || chosen === bot) {
+                // Primary bot queue
+                enqueuePrimaryChat(full);
+            } else if (chosen._queue) {
+                chosen._queue.send(full);
+            } else {
+                try { chosen.chat(full); } catch (err) { console.error('[RandomBot] Chat error:', err.message); }
+            }
+        };
+
+        if (cleanText.length <= limit) {
+            sendChunk(cleanText);
+        } else {
+            const chunks = splitIntoChunks(cleanText, limit);
+            for (const chunk of chunks) {
+                sendChunk(chunk);
+            }
+        }
+    } catch (err) {
+        console.error('[Error] sendSmartChatRandom:', err);
+    }
+}
+
+/**
+ * Splits a long string into chunks no longer than maxLength.
+ * Prefers sentence then word boundaries; hard-cuts oversized words.
  *
  * @param {string} text
  * @param {number} maxLength
@@ -1967,22 +2323,62 @@ function splitIntoChunks(text, maxLength) {
     return chunks;
 }
 
+// ===================================================================
+// SECTION 34 — UTILITY
+// ===================================================================
+
 /** @param {number} ms */
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// -------------------------------------------------------------------
-// PROCESS GUARDS
-// -------------------------------------------------------------------
+// ===================================================================
+// SECTION 35 — PROCESS GUARDS
+// ===================================================================
+
 process.on('SIGINT', () => {
     console.log('[SIGINT] Shutting down...');
     stop8b8tLoop();
     try { if (bot) bot.quit(); } catch {}
+    // Quit all secondary bots
+    for (const b of allAtOnceBots) {
+        try { b.removeAllListeners(); b.quit(); } catch {}
+    }
     process.exit(0);
 });
 
-process.on('uncaughtException',  (err)       => console.error('[Fatal] Uncaught exception:', err));
-process.on('unhandledRejection', (reason, p) => console.error('[Fatal] Unhandled rejection:', p, reason));
+process.on('uncaughtException',  (err)       => {
+    console.error('[Fatal] Uncaught exception:', err);
+    // Do NOT exit — keep DPS_Gemini alive
+});
 
-// -------------------------------------------------------------------
-console.log('[Bot] Starting...');
+process.on('unhandledRejection', (reason, p) => {
+    console.error('[Fatal] Unhandled rejection at:', p, 'reason:', reason);
+    // Do NOT exit — keep DPS_Gemini alive
+});
+
+// ===================================================================
+// SECTION 36 — STATUS REPORTER (QoL)
+// ===================================================================
+// Logs a concise status summary every 10 minutes.
+
+setInterval(() => {
+    const activeBots = getAllActiveBots().length;
+    const mode       = activeMode === 'normal' ? 'DPS_Gemini' : `${activeMode}[${activeIndex}] (${botArgs.username})`;
+    console.log(
+        `[Status] identity=${mode} | ready=${botReady} | bots=${activeBots} | ` +
+        `primer=${primerPending ? `PENDING(${primerBots.length}/${primerExpectedCount})` : 'off'} | ` +
+        `tempWL=${tempWhitelist.size} | bans=${tempBans.size} | conversations=${userConversations.size}`
+    );
+}, 10 * 60 * 1000);
+
+// ===================================================================
+// SECTION 37 — BOOT
+// ===================================================================
+
+console.log('[Bot] Starting DPS_Gemini v3.0...');
+console.log(`[Bot] Super users: ${[...SUPER_USERS].join(', ')}`);
+console.log(`[Bot] Server: ${botArgs.host}:${botArgs.port} (MC ${botArgs.version})`);
 createBot();
+
+// ===================================================================
+// END OF FILE
+// ===================================================================
