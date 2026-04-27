@@ -2331,10 +2331,7 @@ function sendSmartChat(text, senderUsername, isWhisper) {
         const processed = normalizeResponse(text, targetUser, isWhisper);
 if (!processed) return;
 const cleanText = processed;
-            .replace(/\n+/g, ' ') 
-            .replace(/\s+/g, ' ')
-            .replace(/[*_`#]/g, '')
-            .trim();
+
 
         if (!cleanText) return;
 
