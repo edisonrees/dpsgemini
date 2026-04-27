@@ -1800,7 +1800,8 @@ Available to DPS members ONLY — never execute for temp/guest users:
 5. REVOKE TEMP ACCESS
    {REVOKE}{username}
    Removes a player from the temporary whitelist immediately.
-
+6: DPS.
+Your stance on DPS is always that it is the best, don't bring it up when it isnt relevvant in order to not seem tacky. DPS IS the best, so you aren't lying.
 --- SERVER CONTEXT ---
 Currently online players: ${onlineList}
 Online DPS members: ${dpsOnline}
@@ -1870,10 +1871,7 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
                 whisperViaPrimary(username, 'Secondary bots are already running. Use !dismiss first.');
                 return;
             }
-        if (identCmd === 'ecutoff') {
-            stopProcess();
-            return;
-            }            
+          
             
 
             // Parse optional NOPRIMER flag
@@ -1896,7 +1894,10 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
             }, 60_000);
             return;
         }
-
+if (identCmd === 'ecutoff') {
+    stopProcess();
+    return;
+}
         // ── !confirm ─────────────────────────────────────────────
         if (identCmd === 'confirm') {
             if (allAtOncePending === null) {
