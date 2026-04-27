@@ -262,7 +262,7 @@ function getFleetUsernames() {
 function getRandomBot() {
     const active = getAllActiveBots();
     if (active.length === 0) return null;
-    return active[Math.floor(Math.random() * active.length)];
+    return null
 }
 
 /**
