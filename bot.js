@@ -56,6 +56,248 @@ const MAX_PENDING_TRACKED = 50;
 const handledByPacket = new Set();
 
 // -------------------------------------------------------------------
+// IDENTITY MODE  (normal | switch | incognito)
+// -------------------------------------------------------------------
+// Tracks the current active identity the bot is logged in as.
+// activeMode: 'normal' | 'switch' | 'incognito'
+// activeIndex: the N chosen when switching, or null in normal mode
+let activeMode  = 'normal';
+let activeIndex = null;
+
+// The two superusers allowed to trigger identity commands
+const SUPER_USERS = new Set(['freddison', 'kurtzmc']);
+
+// -------------------------------------------------------------------
+// ALL-AT-ONCE STATE
+// -------------------------------------------------------------------
+// Tracks whether we're waiting for !confirm, and holds all the extra
+// bot instances spun up by !allatonce.
+//
+// allAtOncePending: username who ran !allatonce, or null
+// allAtOnceBots:    Array of mineflayer bot instances (non-primary)
+let allAtOncePending = null;
+let allAtOnceBots    = [];
+
+function isSuperUser(username) {
+    return SUPER_USERS.has(username.toLowerCase());
+}
+
+/**
+ * Returns the bot credentials for a given mode + index.
+ * For 'normal': uses the default botArgs username + PASSWORD.
+ * For 'switch': reads SWITCH{N} and SPASS{N} env vars.
+ * For 'incognito': reads INCOG{N} and IPASS{N} env vars.
+ */
+function getIdentityCredentials(mode, index) {
+    if (mode === 'normal') {
+        return { username: botArgs.username, password: PASSWORD };
+    }
+    if (mode === 'switch') {
+        const username = process.env[`SWITCH${index}`];
+        const password = process.env[`SPASS${index}`];
+        return { username, password };
+    }
+    if (mode === 'incognito') {
+        const username = process.env[`INCOG${index}`];
+        const password = process.env[`IPASS${index}`];
+        return { username, password };
+    }
+    return null;
+}
+
+/**
+ * Switches the bot's identity.
+ * Disconnects the current session and reconnects using new credentials.
+ * @param {string} mode - 'normal' | 'switch' | 'incognito'
+ * @param {number|null} index - the N chosen (null for normal)
+ * @param {string} requestingUser - username who issued the command (for feedback)
+ */
+function switchIdentity(mode, index, requestingUser) {
+    const creds = getIdentityCredentials(mode, index);
+
+    if (!creds || !creds.username || !creds.password) {
+        console.error(`[Identity] Missing env vars for mode=${mode} index=${index}`);
+        safeChat(`/msg ${requestingUser} Error: credentials not configured for that slot (check env vars).`);
+        return;
+    }
+
+    console.log(`[Identity] ${requestingUser} triggered ${mode}${index !== null ? ` (slot ${index})` : ''} — switching to ${creds.username}`);
+    safeChat(`/msg ${requestingUser} Switching identity to ${creds.username}… reconnecting.`);
+
+    activeMode  = mode;
+    activeIndex = index;
+
+    // Patch botArgs so createBot uses the new credentials on reconnect
+    botArgs.username = creds.username;
+    // PASSWORD is used inside the spawn handler; we track it separately
+    currentPassword = creds.password;
+
+    // Trigger a clean reconnect
+    stop8b8tLoop();
+    scheduleReconnect(`identity-switch-to-${mode}`);
+}
+
+// currentPassword shadows the module-level PASSWORD for the active session
+// so we don't have to mutate the const. Starts as the default password.
+let currentPassword = PASSWORD;
+
+// -------------------------------------------------------------------
+// IDENTITY COMMAND PARSERS
+// -------------------------------------------------------------------
+// Strips !switch / !incognito / !normal from a string and returns
+// { command: 'switch'|'incognito'|'normal'|null, rest: string }
+function parseIdentityCommand(text) {
+    const trimmed = text.trim();
+
+    if (/^!switch\b/i.test(trimmed)) {
+        return { command: 'switch', rest: trimmed.replace(/^!switch\s*/i, '').trim() };
+    }
+    if (/^!incognito\b/i.test(trimmed)) {
+        return { command: 'incognito', rest: trimmed.replace(/^!incognito\s*/i, '').trim() };
+    }
+    if (/^!normal\b/i.test(trimmed)) {
+        return { command: 'normal', rest: trimmed.replace(/^!normal\s*/i, '').trim() };
+    }
+    if (/^!allatonce\b/i.test(trimmed)) {
+        return { command: 'allatonce', rest: trimmed.replace(/^!allatonce\s*/i, '').trim() };
+    }
+    if (/^!confirm\b/i.test(trimmed)) {
+        return { command: 'confirm', rest: trimmed.replace(/^!confirm\s*/i, '').trim() };
+    }
+    if (/^!dismiss\b/i.test(trimmed)) {
+        return { command: 'dismiss', rest: trimmed.replace(/^!dismiss\s*/i, '').trim() };
+    }
+    return { command: null, rest: trimmed };
+}
+
+// -------------------------------------------------------------------
+// ALL-AT-ONCE HELPERS
+// -------------------------------------------------------------------
+
+/**
+ * Collects every valid credential set across all switch and incognito slots.
+ * Returns an array of { username, password, label } objects.
+ * Skips any slot whose env vars are missing or empty.
+ */
+function getAllAccountCredentials() {
+    const accounts = [];
+
+    for (let n = 1; n <= 5; n++) {
+        const username = process.env[`SWITCH${n}`];
+        const password = process.env[`SPASS${n}`];
+        if (username && password) accounts.push({ username, password, label: `SWITCH${n}` });
+    }
+
+    for (let n = 1; n <= 8; n++) {
+        const username = process.env[`INCOG${n}`];
+        const password = process.env[`IPASS${n}`];
+        if (username && password) accounts.push({ username, password, label: `INCOG${n}` });
+    }
+
+    return accounts;
+}
+
+/**
+ * Spawns a secondary bot for a single account.
+ * The bot logs in with /login and then sits idle — it doesn't process
+ * commands. Returns the mineflayer bot instance.
+ */
+function spawnSecondaryBot(username, password) {
+    const secondaryBot = mineflayer.createBot({
+        host:     botArgs.host,
+        port:     botArgs.port,
+        username: username,
+        auth:     'offline',
+        version:  botArgs.version,
+    });
+
+    secondaryBot.once('spawn', () => {
+        console.log(`[AllAtOnce] ${username} spawned`);
+        const tryLogin = () => {
+            if (secondaryBot?.chat) {
+                try {
+                    secondaryBot.chat(`/login ${password}`);
+                    console.log(`[AllAtOnce] ${username} login sent`);
+                } catch (err) {
+                    console.error(`[AllAtOnce] ${username} login failed, retrying:`, err.message);
+                    setTimeout(tryLogin, 3000);
+                }
+            } else {
+                setTimeout(tryLogin, 3000);
+            }
+        };
+        setTimeout(tryLogin, 5000);
+    });
+
+    secondaryBot.on('error', (err) => {
+        console.error(`[AllAtOnce] ${username} error:`, err.message);
+    });
+
+    secondaryBot.on('kicked', (reason) => {
+        console.log(`[AllAtOnce] ${username} kicked:`, reason);
+    });
+
+    secondaryBot.on('end', () => {
+        console.log(`[AllAtOnce] ${username} disconnected`);
+    });
+
+    return secondaryBot;
+}
+
+/**
+ * Launches all secondary bots (all switch + incognito accounts).
+ * Staggers connections by 3 s each to avoid server flood kicks.
+ * @param {string} requestingUser - for feedback whispers
+ */
+function launchAllAtOnce(requestingUser) {
+    const accounts = getAllAccountCredentials();
+
+    if (accounts.length === 0) {
+        safeChat(`/msg ${requestingUser} No secondary accounts are configured — check your env vars.`);
+        return;
+    }
+
+    console.log(`[AllAtOnce] Launching ${accounts.length} secondary bots…`);
+    safeChat(`/msg ${requestingUser} Launching ${accounts.length} accounts. Use !dismiss to bring them all offline.`);
+
+    accounts.forEach(({ username, password, label }, i) => {
+        setTimeout(() => {
+            console.log(`[AllAtOnce] Spawning ${username} (${label})`);
+            const b = spawnSecondaryBot(username, password);
+            allAtOnceBots.push(b);
+        }, i * 3000); // 3 s stagger
+    });
+}
+
+/**
+ * Disconnects and clears all secondary bots spawned by !allatonce.
+ * The primary DPS_Gemini bot is unaffected.
+ * @param {string} requestingUser - for feedback whispers
+ */
+function dismissAllAtOnce(requestingUser) {
+    if (allAtOnceBots.length === 0) {
+        safeChat(`/msg ${requestingUser} No secondary bots are currently running.`);
+        return;
+    }
+
+    const count = allAtOnceBots.length;
+    console.log(`[AllAtOnce] Dismissing ${count} secondary bots…`);
+
+    for (const b of allAtOnceBots) {
+        try {
+            b.removeAllListeners();
+            b.quit();
+        } catch (err) {
+            console.error('[AllAtOnce] Error quitting bot:', err.message);
+        }
+    }
+
+    allAtOnceBots = [];
+    console.log('[AllAtOnce] All secondary bots dismissed');
+    safeChat(`/msg ${requestingUser} Done — ${count} secondary bot(s) disconnected.`);
+}
+
+// -------------------------------------------------------------------
 // BAN HELPERS
 // -------------------------------------------------------------------
 
@@ -551,7 +793,7 @@ function setupBotEvents() {
         const tryLogin = () => {
             if (bot?.chat) {
                 try {
-                    bot.chat(`/login ${PASSWORD}`);
+                    bot.chat(`/login ${currentPassword}`);
                     console.log('[Bot] Login command sent');
                     setTimeout(() => start8b8tLoop(), 10000);
                 } catch (err) {
@@ -768,6 +1010,88 @@ After any command executes, the bot will confirm to the requesting user automati
 async function handleRequest(username, message, isWhisper, hoverStats = null) {
     if (!username || !message) return;
     if (username === bot?.username) return;
+
+    // ── IDENTITY COMMANDS (!switch, !incognito, !normal) ─────────
+    // These are intercepted BEFORE the role/ban checks so they always
+    // reach the super-user gate regardless of whitelist state.
+    const { command: identCmd, rest: identRest } = parseIdentityCommand(message.trim());
+    if (identCmd) {
+        if (!isSuperUser(username)) {
+            console.log(`[Identity] ${username} tried ${identCmd} — not a super user, ignoring silently`);
+            // Silently ignore — don't reveal the feature exists to randos
+            return;
+        }
+
+        if (identCmd === 'switch') {
+            const n = Math.floor(Math.random() * 5) + 1; // 1–5
+            switchIdentity('switch', n, username);
+            return;
+        }
+
+        if (identCmd === 'incognito') {
+            const n = Math.floor(Math.random() * 8) + 1; // 1–8
+            switchIdentity('incognito', n, username);
+            return;
+        }
+
+        if (identCmd === 'normal') {
+            if (activeMode === 'normal') {
+                safeChat(`/msg ${username} Already running as the normal identity.`);
+                return;
+            }
+            // Restore defaults
+            botArgs.username = 'DPS_Gemini';
+            currentPassword  = PASSWORD;
+            activeMode       = 'normal';
+            activeIndex      = null;
+            console.log(`[Identity] ${username} restored normal identity`);
+            safeChat(`/msg ${username} Reverting to normal identity… reconnecting.`);
+            stop8b8tLoop();
+            scheduleReconnect('identity-switch-to-normal');
+            return;
+        }
+
+        if (identCmd === 'allatonce') {
+            if (allAtOnceBots.length > 0) {
+                safeChat(`/msg ${username} Secondary bots are already running. Use !dismiss first.`);
+                return;
+            }
+            // Set pending confirmation, attributed to this superuser
+            allAtOncePending = username;
+            console.log(`[AllAtOnce] ${username} requested !allatonce — awaiting !confirm`);
+            safeChat(`/msg ${username} Are you sure? This will log ALL accounts onto the server simultaneously. Whisper !confirm to proceed, or just ignore to cancel.`);
+            // Auto-expire the pending state after 60 s to avoid ghost confirmations
+            setTimeout(() => {
+                if (allAtOncePending === username) {
+                    allAtOncePending = null;
+                    console.log('[AllAtOnce] Confirmation window expired');
+                }
+            }, 60_000);
+            return;
+        }
+
+        if (identCmd === 'confirm') {
+            if (allAtOncePending === null) {
+                safeChat(`/msg ${username} No pending !allatonce to confirm.`);
+                return;
+            }
+            if (allAtOncePending !== username) {
+                // A different superuser issued the allatonce — only they can confirm it
+                safeChat(`/msg ${username} You didn't initiate !allatonce — only ${allAtOncePending} can confirm it.`);
+                return;
+            }
+            allAtOncePending = null;
+            console.log(`[AllAtOnce] ${username} confirmed — launching all bots`);
+            launchAllAtOnce(username);
+            return;
+        }
+
+        if (identCmd === 'dismiss') {
+            allAtOncePending = null; // also cancel any pending confirmation
+            dismissAllAtOnce(username);
+            return;
+        }
+    }
 
     const role = getUserRole(username);
 
