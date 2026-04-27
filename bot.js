@@ -2278,7 +2278,7 @@ async function callGemini(username, history, hoverStats = null, newsContext = nu
         if (!response?.text) throw new Error('Empty response from API');
 
         const responseText = response.text.trim();
-        console.log(`[Response] ${username}: ${responseText.length} chars`);
+        console.log(`[Response] ${username}: ${responseText} chars`);
         return responseText;
 
     } catch (err) {
