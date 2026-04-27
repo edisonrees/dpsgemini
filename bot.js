@@ -120,7 +120,22 @@ const GATHERING_DATA_REGEX = /^\s*Gathering Data\.{3}\s*$/i;
 // ===================================================================
 // SECTION 1 — SANITISER
 // ===================================================================
+function normalizeResponse(text, senderUsername, isWhisper) {
+    const talk = parseTalkCommand(text);
 
+    if (talk) {
+        if (talk.mode === 'C') {
+            safeChat(talk.message);
+        } else if (talk.mode === 'W') {
+            broadcastAllBots(`/msg ${talk.target} ${talk.message}`);
+        }
+        return null; // IMPORTANT: prevents leaking into chat
+    }
+
+    return text
+        .replace(/\{[^}]+\}/g, '')
+        .trim();
+}
 /**
  * Strips non-printable-ASCII characters and Minecraft colour codes
  * from a string so it is safe to send to 8b8t.
@@ -2315,7 +2330,9 @@ function sendSmartChat(text, senderUsername, isWhisper) {
        
         // -------------------------------------------------------
 
-        const cleanText = text
+        const processed = normalizeResponse(text, targetUser, isWhisper);
+if (!processed) return;
+const cleanText = processed;
             .replace(/\n+/g, ' ') 
             .replace(/\s+/g, ' ')
             .replace(/[*_`#]/g, '')
