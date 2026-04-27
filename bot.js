@@ -22,7 +22,7 @@ let reconnecting        = false;
 let reconnectAttempts   = 0;
 const MAX_RECONNECT_ATTEMPTS = 10000;
 const RECONNECT_DELAY        = 15000;
-
+let allAtOnceActive = true;
 let approvedPlayers = new Set();
 
 // Map of username (lowercase) -> { remaining: number | Infinity }
@@ -215,110 +215,127 @@ function spawnSecondaryBot(username, password, attempt = 1) {
     console.log(`[AllAtOnce] Connecting ${username} (attempt ${attempt}/${ALL_AT_ONCE_MAX_RETRIES})`);
 
     const secondaryBot = mineflayer.createBot({
-        host:     botArgs.host,
-        port:     botArgs.port,
-        username: username,
-        auth:     'offline',
-        version:  botArgs.version,
+        host: botArgs.host,
+        port: botArgs.port,
+        username,
+        auth: 'offline',
+        version: botArgs.version,
     });
 
-    // Per-bot keepalive interval — cleared on disconnect so it never
-    // outlives the connection it belongs to.
     let keepaliveInterval = null;
+    let alive = true;
 
-    function stopKeepalive() {
+    const stopKeepalive = () => {
         if (keepaliveInterval) {
             clearInterval(keepaliveInterval);
             keepaliveInterval = null;
         }
-    }
+    };
 
-    function startKeepalive() {
+    const startKeepalive = () => {
         stopKeepalive();
+
         keepaliveInterval = setInterval(() => {
-            if (!secondaryBot?.chat) return;
+            if (!alive || !secondaryBot?.chat) return;
+
             try {
                 secondaryBot.chat(`/login ${password}`);
                 console.log(`[AllAtOnce/keepalive] ${username} /login sent`);
-            } catch (err) {
-                console.error(`[AllAtOnce/keepalive] ${username} /login error:`, err.message);
+            } catch (e) {
+                console.error(`[AllAtOnce/keepalive] ${username} login error:`, e.message);
             }
+
             setTimeout(() => {
-                if (!secondaryBot?.chat) return;
+                if (!alive || !secondaryBot?.chat) return;
+
                 try {
                     secondaryBot.chat('/8b8t');
                     console.log(`[AllAtOnce/keepalive] ${username} /8b8t sent`);
-                } catch (err) {
-                    console.error(`[AllAtOnce/keepalive] ${username} /8b8t error:`, err.message);
+                } catch (e) {
+                    console.error(`[AllAtOnce/keepalive] ${username} 8b8t error:`, e.message);
                 }
             }, 2000);
-        }, 15_000);
-        console.log(`[AllAtOnce] ${username} keepalive started (every 15s)`);
-    }
 
-    secondaryBot.once('spawn', () => {
-        console.log(`[AllAtOnce] ${username} spawned`);
-        const tryLogin = () => {
-            if (secondaryBot?.chat) {
-                try {
-                    secondaryBot.chat(`/login ${password}`);
-                    console.log(`[AllAtOnce] ${username} initial login sent`);
-                    // 2 s later send /8b8t, then start the repeating keepalive
-                    setTimeout(() => {
-                        if (!secondaryBot?.chat) return;
-                        try {
-                            secondaryBot.chat('/8b8t');
-                            console.log(`[AllAtOnce] ${username} initial /8b8t sent`);
-                        } catch (err) {
-                            console.error(`[AllAtOnce] ${username} initial /8b8t error:`, err.message);
-                        }
-                        startKeepalive();
-                    }, 2000);
-                } catch (err) {
-                    console.error(`[AllAtOnce] ${username} initial login error, retrying:`, err.message);
-                    setTimeout(tryLogin, 3000);
-                }
-            } else {
-                setTimeout(tryLogin, 3000);
-            }
-        };
-        setTimeout(tryLogin, 5000);
-    });
+        }, 15000);
 
-    secondaryBot.on('error', (err) => {
-        console.error(`[AllAtOnce] ${username} error:`, err.message);
-    });
+        console.log(`[AllAtOnce] ${username} keepalive active`);
+    };
 
-    const handleGone = (reason) => {
+    const handleShutdown = (reason) => {
+        if (!alive) return;
+        alive = false;
+
         stopKeepalive();
-
-        // !dismiss cleared the array — do not retry
-        if (allAtOnceBots.length === 0) return;
 
         const idx = allAtOnceBots.indexOf(secondaryBot);
         if (idx !== -1) allAtOnceBots.splice(idx, 1);
 
+        if (allAtOnceBots.length === 0) return;
+
         if (attempt < ALL_AT_ONCE_MAX_RETRIES) {
-            console.log(`[AllAtOnce] ${username} gone (${reason}) — retrying in ${ALL_AT_ONCE_RETRY_DELAY / 1000}s`);
+            console.log(`[AllAtOnce] ${username} dropped (${reason}) retrying...`);
+
             setTimeout(() => {
-                if (allAtOnceBots.length === 0) return; // dismissed while waiting
+                if (allAtOnceBots.length === 0) return;
                 const newBot = spawnSecondaryBot(username, password, attempt + 1);
                 allAtOnceBots.push(newBot);
             }, ALL_AT_ONCE_RETRY_DELAY);
+
         } else {
-            console.log(`[AllAtOnce] ${username} gave up after ${ALL_AT_ONCE_MAX_RETRIES} attempts`);
+            console.log(`[AllAtOnce] ${username} exceeded retry limit`);
         }
     };
 
-    secondaryBot.on('kicked', (reason) => {
-        console.log(`[AllAtOnce] ${username} kicked:`, reason);
-        handleGone('kicked');
+    secondaryBot.once('spawn', () => {
+        console.log(`[AllAtOnce] ${username} spawned`);
+
+        setTimeout(() => {
+            if (!alive || !secondaryBot?.chat) return;
+
+            try {
+                secondaryBot.chat(`/login ${password}`);
+                console.log(`[AllAtOnce] ${username} login sent`);
+            } catch (e) {
+                console.error(`[AllAtOnce] ${username} login error:`, e.message);
+                return;
+            }
+
+            setTimeout(() => {
+                if (!alive || !secondaryBot?.chat) return;
+
+                try {
+                    secondaryBot.chat('/8b8t');
+                    console.log(`[AllAtOnce] ${username} initial /8b8t sent`);
+                } catch (e) {
+                    console.error(`[AllAtOnce] ${username} /8b8t error:`, e.message);
+                }
+
+                startKeepalive();
+            }, 2000);
+
+        }, 5000);
     });
 
-    secondaryBot.on('end', (reason) => {
-        console.log(`[AllAtOnce] ${username} disconnected:`, reason);
-        handleGone('end');
+    secondaryBot.on('message', (jsonMsg) => {
+        try {
+            const text = jsonMsg?.toString?.() ?? jsonMsg?.text;
+            if (!text) return;
+            if (text.includes(secondaryBot.username)) return;
+
+            if (bot?.chat) {
+                safeChat(`/msg DPS_Gemini [AllAtOnce:${username}] ${text}`);
+            }
+        } catch (e) {
+            console.error(`[AllAtOnce/relay] ${username} error:`, e.message);
+        }
     });
+
+    secondaryBot.on('error', (err) => {
+        console.error(`[AllAtOnce] ${username} error:`, err?.message || err);
+    });
+
+    secondaryBot.on('kicked', (reason) => handleShutdown('kicked'));
+    secondaryBot.on('end', (reason) => handleShutdown('end'));
 
     return secondaryBot;
 }
