@@ -48,6 +48,7 @@ const ai = new GoogleGenAI({ apiKey: API_KEY });
 
 const MAX_RECONNECT_ATTEMPTS  = 10000;
 const RECONNECT_DELAY         = 15000;
+const BOT_JOIN_DELAY          = 2000;
 const MSG_LIMIT               = 5;
 const TIME_WINDOW             = 2 * 60 * 1000;        // 2 minutes
 const MAX_RETRIES             = 3;
@@ -58,7 +59,7 @@ const MAX_PENDING_TRACKED     = 50;
 const PRIMARY_CHAT_GAP_MS     = 700;
 const SECONDARY_CHAT_GAP_MS   = 1500;
 const SECONDARY_KEEPALIVE_MS  = 5 * 60 * 1000;        // 5 minutes
-const ALL_AT_ONCE_STAGGER_MS  = 12000;
+const ALL_AT_ONCE_STAGGER_MS  = 2000;
 const ALL_AT_ONCE_RETRY_DELAY = 30000;
 const ALL_AT_ONCE_MAX_RETRIES = 3;
 const MEMORY_CHECK_INTERVAL   = 60 * 1000;
