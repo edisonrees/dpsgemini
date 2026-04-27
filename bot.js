@@ -350,8 +350,6 @@ async function stopProcess() { // Added 'async' so await works
     try {
         bot.quit();
     } catch (e) {}
-
-    return selfDestruct.now();
     process.exit(1);
 }
 /**
