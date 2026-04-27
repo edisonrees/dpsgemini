@@ -197,12 +197,22 @@ function getAllAccountCredentials() {
     return accounts;
 }
 
+// ms between each secondary bot connection attempt — wide enough to avoid
+// "logging in too fast" kicks from the server.
+const ALL_AT_ONCE_STAGGER_MS  = 10000;
+// ms to wait before retrying a secondary bot that got kicked or dropped.
+const ALL_AT_ONCE_RETRY_DELAY = 25000;
+// How many times a secondary bot will retry before giving up permanently.
+const ALL_AT_ONCE_MAX_RETRIES = 3;
+
 /**
- * Spawns a secondary bot for a single account.
- * The bot logs in with /login and then sits idle — it doesn't process
- * commands. Returns the mineflayer bot instance.
+ * Spawns a single secondary bot. Logs in on spawn, retries up to
+ * ALL_AT_ONCE_MAX_RETRIES times if it gets kicked or disconnects.
+ * Returns the mineflayer bot instance.
  */
-function spawnSecondaryBot(username, password) {
+function spawnSecondaryBot(username, password, attempt = 1) {
+    console.log(`[AllAtOnce] Connecting ${username} (attempt ${attempt}/${ALL_AT_ONCE_MAX_RETRIES})`);
+
     const secondaryBot = mineflayer.createBot({
         host:     botArgs.host,
         port:     botArgs.port,
@@ -219,7 +229,7 @@ function spawnSecondaryBot(username, password) {
                     secondaryBot.chat(`/login ${password}`);
                     console.log(`[AllAtOnce] ${username} login sent`);
                 } catch (err) {
-                    console.error(`[AllAtOnce] ${username} login failed, retrying:`, err.message);
+                    console.error(`[AllAtOnce] ${username} login error, retrying:`, err.message);
                     setTimeout(tryLogin, 3000);
                 }
             } else {
@@ -233,12 +243,37 @@ function spawnSecondaryBot(username, password) {
         console.error(`[AllAtOnce] ${username} error:`, err.message);
     });
 
+    // Shared handler for both kick and clean disconnect
+    const handleGone = (reason) => {
+        // If !dismiss already cleared the array, don't retry — we're done
+        if (allAtOnceBots.length === 0) return;
+
+        // Remove this dead instance from the live list
+        const idx = allAtOnceBots.indexOf(secondaryBot);
+        if (idx !== -1) allAtOnceBots.splice(idx, 1);
+
+        if (attempt < ALL_AT_ONCE_MAX_RETRIES) {
+            console.log(`[AllAtOnce] ${username} gone (${reason}) — retrying in ${ALL_AT_ONCE_RETRY_DELAY / 1000}s`);
+            setTimeout(() => {
+                // Double-check we haven't been dismissed while waiting
+                if (allAtOnceBots.length !== 0 || allAtOnceBots === []) {
+                    const newBot = spawnSecondaryBot(username, password, attempt + 1);
+                    allAtOnceBots.push(newBot);
+                }
+            }, ALL_AT_ONCE_RETRY_DELAY);
+        } else {
+            console.log(`[AllAtOnce] ${username} gave up after ${ALL_AT_ONCE_MAX_RETRIES} attempts`);
+        }
+    };
+
     secondaryBot.on('kicked', (reason) => {
         console.log(`[AllAtOnce] ${username} kicked:`, reason);
+        handleGone('kicked');
     });
 
-    secondaryBot.on('end', () => {
-        console.log(`[AllAtOnce] ${username} disconnected`);
+    secondaryBot.on('end', (reason) => {
+        console.log(`[AllAtOnce] ${username} disconnected:`, reason);
+        handleGone('end');
     });
 
     return secondaryBot;
@@ -246,33 +281,36 @@ function spawnSecondaryBot(username, password) {
 
 /**
  * Launches all secondary bots (all switch + incognito accounts).
- * Staggers connections by 3 s each to avoid server flood kicks.
- * @param {string} requestingUser - for feedback whispers
+ * Staggers connections by ALL_AT_ONCE_STAGGER_MS to avoid flood kicks.
  */
 function launchAllAtOnce(requestingUser) {
     const accounts = getAllAccountCredentials();
 
     if (accounts.length === 0) {
-        safeChat(`/msg ${requestingUser} No secondary accounts are configured — check your env vars.`);
+        safeChat(`/msg ${requestingUser} No secondary accounts configured — check env vars.`);
         return;
     }
 
-    console.log(`[AllAtOnce] Launching ${accounts.length} secondary bots…`);
-    safeChat(`/msg ${requestingUser} Launching ${accounts.length} accounts. Use !dismiss to bring them all offline.`);
+    const totalSecs = Math.round((accounts.length - 1) * ALL_AT_ONCE_STAGGER_MS / 1000);
+    console.log(`[AllAtOnce] Launching ${accounts.length} bots with ${ALL_AT_ONCE_STAGGER_MS / 1000}s stagger (~${totalSecs}s total)`);
+    safeChat(`/msg ${requestingUser} Launching ${accounts.length} accounts over ~${totalSecs}s. Use !dismiss to pull them all offline.`);
 
     accounts.forEach(({ username, password, label }, i) => {
         setTimeout(() => {
-            console.log(`[AllAtOnce] Spawning ${username} (${label})`);
+            // Abort remaining launches if !dismiss was called mid-sequence
+            if (allAtOnceBots === null) return;
+            console.log(`[AllAtOnce] Queuing ${username} (${label})`);
             const b = spawnSecondaryBot(username, password);
             allAtOnceBots.push(b);
-        }, i * 3000); // 3 s stagger
+        }, i * ALL_AT_ONCE_STAGGER_MS);
     });
 }
 
 /**
  * Disconnects and clears all secondary bots spawned by !allatonce.
  * The primary DPS_Gemini bot is unaffected.
- * @param {string} requestingUser - for feedback whispers
+ * Sets allAtOnceBots to [] FIRST so any in-flight retry timeouts see an
+ * empty array and abort before spawning new connections.
  */
 function dismissAllAtOnce(requestingUser) {
     if (allAtOnceBots.length === 0) {
@@ -280,10 +318,15 @@ function dismissAllAtOnce(requestingUser) {
         return;
     }
 
-    const count = allAtOnceBots.length;
+    const toQuit = [...allAtOnceBots];
+    const count  = toQuit.length;
+
+    // Clear first — retry handlers check this before respawning
+    allAtOnceBots = [];
+
     console.log(`[AllAtOnce] Dismissing ${count} secondary bots…`);
 
-    for (const b of allAtOnceBots) {
+    for (const b of toQuit) {
         try {
             b.removeAllListeners();
             b.quit();
@@ -292,7 +335,6 @@ function dismissAllAtOnce(requestingUser) {
         }
     }
 
-    allAtOnceBots = [];
     console.log('[AllAtOnce] All secondary bots dismissed');
     safeChat(`/msg ${requestingUser} Done — ${count} secondary bot(s) disconnected.`);
 }
