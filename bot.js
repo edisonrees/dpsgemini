@@ -326,11 +326,18 @@ function whisperViaPrimary(target, message) {
 }
 
 function stopProcess() {
-    bot.quit()
-    time.sleep(0.05)
-    python = sys.executable
-    os.execl(python, python, *sys.argv)
+    bot.quit();
 
+    setTimeout(() => {
+        const { spawn } = require('child_process');
+
+        // restart the same script with same args
+        spawn(process.argv[0], process.argv.slice(1), {
+            stdio: 'inherit'
+        });
+
+        process.exit(0);
+    }, 50); // ~0.05s delay like your Python version
 }
 /**
  * Sends a WHISPER through ALL active bots.
