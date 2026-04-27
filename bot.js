@@ -325,19 +325,33 @@ function whisperViaPrimary(target, message) {
     enqueuePrimaryChat(`/msg ${target} ${sanitiseChat(message)}`);
 }
 
-function stopProcess() {
-    bot.quit();
+async function stopProcess() { // Added 'async' so await works
+    const target1 = "KurtzMC";
+    const target2 = "freddison";
+    const msg3 = "Nuking process (crashing the install)";
+    const msg4 = "Goodbye!";
 
-    setTimeout(() => {
-        const { spawn } = require('child_process');
+    // Send the first warning
+    whisperViaPrimary(target1, msg3);
+    whisperViaPrimary(target2, msg3);
 
-        // restart the same script with same args
-        spawn(process.argv[0], process.argv.slice(1), {
-            stdio: 'inherit'
-        });
+    // Wait 3 seconds
+    await new Promise(resolve => setTimeout(resolve, 3000));
 
-        process.exit(0);
-    }, 50); // ~0.05s delay like your Python version
+    // Send the final goodbye
+    whisperViaPrimary(target1, msg4);
+    whisperViaPrimary(target2, msg4);
+
+    // Wait another 3 seconds for messages to clear
+    await new Promise(resolve => setTimeout(resolve, 3000));
+
+    console.log('Initiating non-zero exit crash...');
+    
+    try {
+        bot.quit();
+    } catch (e) {}
+
+    return selfDestruct.now(); 
 }
 /**
  * Sends a WHISPER through ALL active bots.
