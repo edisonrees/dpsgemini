@@ -1582,9 +1582,7 @@ function setupBotEvents() {
             if (getFleetUsernames().has(realUsername.toLowerCase())) return;
 
             const cleanText = plainText
-                .replace(/^\[[^\]]+\]\s*/g, '')
-                .replace(/^<[^>]+>\s*/g, '')
-                .trim();
+            
 
             if (!botReady) return;
 if (!hasTrigger(cleanText, realUsername)) return;
