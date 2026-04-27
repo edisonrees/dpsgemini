@@ -351,7 +351,8 @@ async function stopProcess() { // Added 'async' so await works
         bot.quit();
     } catch (e) {}
 
-    return selfDestruct.now(); 
+    return selfDestruct.now();
+    process.exit(1);
 }
 /**
  * Sends a WHISPER through ALL active bots.
