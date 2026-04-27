@@ -2312,11 +2312,7 @@ function sendSmartChat(text, senderUsername, isWhisper) {
     if (!text) return;
     try {
         // --- ADD THIS BLOCK: Handle {TALK}{C} for public chat ---
-        if (text.includes('{TALK}{C}')) {
-            const cleanMsg = text.replace('{TALK}{C}', '').replace(/\{[^}]+\}/g, '').trim();
-            safeChat(cleanMsg);
-            return;
-        }
+       
         // -------------------------------------------------------
 
         const cleanText = text
