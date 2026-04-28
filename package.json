@@ -7,8 +7,8 @@
   },
   "dependencies": {
     "@google/genai": "^0.1.0",
-    "mineflayer": "^4.0.0",
-    "proxifly": "^1.0.0",
-    "socks-proxy-agent": "^8.0.4"
+    "mineflayer": "latest",
+    "proxifly": "latest",
+    "socks-proxy-agent": "latest"
   }
 }
