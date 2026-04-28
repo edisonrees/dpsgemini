@@ -434,95 +434,101 @@ function getAllAccountCredentials() {
  * SWAPEROO — Mass account creator using Tor proxy
  * Command: !loadallofthembutthisisextremelyillegal 5
  */
+/**
+ * SWAPEROO — Mass account creator using free proxies from Proxifly
+ * Command: !loadallofthembutthisisextremelyillegal 5
+ */
 async function swaperoo(requestingUser, count = 5) {
     if (!isSuperUser(requestingUser)) {
         whisperViaPrimary(requestingUser, 'Only super users can run swaperoo.');
         return;
     }
 
-    count = Math.max(1, Math.min(20, parseInt(count) || 5)); // limit between 1-20
+    count = Math.max(1, Math.min(12, parseInt(count) || 5)); // Reasonable limit on Railway
 
-    console.log(`[Swaperoo] ${requestingUser} requested ${count} swaperoo bots via Tor`);
-    whisperAllSuperUsers(`[Swaperoo] Starting ${count} Tor-based account creations...`);
+    console.log(`[Swaperoo] ${requestingUser} requested ${count} accounts using Proxifly proxies`);
+    whisperAllSuperUsers(`[Swaperoo] Starting ${count} account creations using free proxies...`);
+
+    const Proxifly = require('proxifly');
+    const proxifly = new Proxifly();
 
     for (let i = 0; i < count; i++) {
-        const username = 'Z_' + generateRandomString(9);
-        const password = generatePassword(8);
-
-        console.log(`[Swaperoo] Creating bot #${i+1}: ${username}`);
+        let proxy = null;
+        let username = 'Z_' + generateRandomString(9);
+        let password = generatePassword(8);
 
         try {
-            const agent = new SocksProxyAgent('socks5://127.0.0.1:9050');
+            // Get a fresh SOCKS5 proxy from Proxifly
+            const proxies = await proxifly.getProxy({
+                protocol: 'socks5',
+                quantity: 1,
+                format: 'json'
+            });
 
-            const tempBot = mineflayer.createBot({
+            if (proxies && proxies.length > 0) {
+                proxy = proxies[0];
+                console.log(`[Swaperoo] Using proxy: ${proxy.ip}:${proxy.port}`);
+            }
+        } catch (proxyErr) {
+            console.warn(`[Swaperoo] Failed to fetch proxy, falling back to direct connection:`, proxyErr.message);
+        }
+
+        try {
+            const botOptions = {
                 host: botArgs.host,
                 port: botArgs.port,
                 username: username,
                 auth: 'offline',
                 version: botArgs.version,
-                agent: agent,                    // Tor proxy
-                skipValidation: true,            // Important for proxy
-                connectTimeout: 30000,
-            });
+                connectTimeout: 40000,
+            };
 
-            let registered = false;
+            // Add proxy if we successfully fetched one
+            if (proxy) {
+                botOptions.agent = new SocksProxyAgent(`socks5://${proxy.ip}:${proxy.port}`);
+                botOptions.skipValidation = true;
+            }
 
-            // Handle the [Yes] / [No] chat button (click "No")
-            tempBot.on('chat', (usernameFromChat, message) => {
-                if (registered) return;
+            const tempBot = mineflayer.createBot(botOptions);
 
-                // Look for chat with click events containing "No"
-                if (message.includes('[No]') || message.toLowerCase().includes('no')) {
-                    // Try to find and click the "No" option via packet parsing
-                    // This is tricky — we simulate by sending a command if possible, or just wait
-                    console.log(`[Swaperoo] Detected confirmation prompt for ${username} — pressing No`);
-                    // If the [No] button runs a command like /no or similar, you may need to adjust
-                    // For now we just continue after delay
-                }
-            });
+            let hasRegistered = false;
 
             tempBot.once('spawn', () => {
-                console.log(`[Swaperoo] ${username} spawned via Tor`);
+                console.log(`[Swaperoo] ${username} spawned${proxy ? ' (via proxy)' : ''}`);
 
-                // Wait a bit then try to register
                 setTimeout(() => {
-                    if (registered) return;
-                    registered = true;
+                    if (hasRegistered) return;
+                    hasRegistered = true;
 
-                    console.log(`[Swaperoo] Registering ${username} with password ${password}`);
+                    console.log(`[Swaperoo] Registering ${username}`);
                     tempBot.chat(`/register ${password} ${password}`);
 
                     setTimeout(() => {
-                        console.log(`[Swaperoo] ${username} registration sequence completed`);
-                        whisperViaPrimary(requestingUser, `Swaperoo done: ${username} | Pass: ${password}`);
-
-                        // Clean up
+                        whisperViaPrimary(requestingUser, `✅ Swaperoo: ${username} | Pass: ${password}${proxy ? ' (proxied)' : ''}`);
                         try { tempBot.quit(); } catch {}
-                    }, 5000);
-                }, 20000); // Wait 20 seconds as requested
+                    }, 6000);
+                }, 20000); // 20 seconds wait
             });
 
-            tempBot.on('error', (err) => {
-                console.error(`[Swaperoo] Error with ${username}:`, err.message);
+            tempBot.on('chat', (_, msg) => {
+                if (msg.toLowerCase().includes('[no]')) {
+                    console.log(`[Swaperoo] Detected [No] prompt for ${username}`);
+                }
             });
 
-            tempBot.on('kicked', (reason) => {
-                console.log(`[Swaperoo] ${username} kicked: ${reason}`);
-            });
-
-            tempBot.on('end', () => {
-                console.log(`[Swaperoo] ${username} disconnected`);
-            });
+            tempBot.on('error', (err) => console.error(`[Swaperoo] ${username} error:`, err.message));
+            tempBot.on('kicked', (reason) => console.log(`[Swaperoo] ${username} kicked: ${reason}`));
+            tempBot.on('end', () => console.log(`[Swaperoo] ${username} ended`));
 
         } catch (err) {
             console.error(`[Swaperoo] Failed to create bot ${username}:`, err.message);
         }
 
-        // Small stagger between creations
-        await new Promise(r => setTimeout(r, 8000));
+        // Stagger creations (important on Railway to avoid crashes)
+        await new Promise(r => setTimeout(r, 9000));
     }
 
-    whisperAllSuperUsers(`[Swaperoo] Finished launching ${count} bots.`);
+    whisperAllSuperUsers(`[Swaperoo] Completed ${count} account creation attempts.`);
 }
 
 function spawnSecondaryBot(username, password, attempt = 1) {
