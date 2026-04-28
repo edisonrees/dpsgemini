@@ -8,5 +8,6 @@
   "dependencies": {
     "mineflayer": "^4.0.0",
     "@google/genai": "latest"
+    "proxifly" : "latest"
   }
 }
