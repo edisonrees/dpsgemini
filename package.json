@@ -1,4 +1,4 @@
-so this for my dep pckg json {
+{
   "name": "mineflayer-gemini-bot",
   "version": "1.0.0",
   "main": "bot.js",
@@ -11,4 +11,4 @@ so this for my dep pckg json {
     "socks-proxy-agent": "^8.0.4",
     "proxifly": "^1.0.0"
   }
-}
+
