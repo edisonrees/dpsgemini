@@ -58,8 +58,10 @@
 const mineflayer = require('mineflayer');
 const { GoogleGenAI, ThinkingLevel } = require('@google/genai');
 const fs = require('fs');
-const SocksProxyAgent = require('socks-proxy-agent').SocksProxyAgent;
 const crypto = require('crypto');
+
+// NEW IMPORTS FOR SWAPEROO
+const SocksProxyAgent = require('socks-proxy-agent').SocksProxyAgent;
 // -------------------------------------------------------------------
 // CONFIGURATION
 // -------------------------------------------------------------------
