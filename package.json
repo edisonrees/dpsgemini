@@ -1,4 +1,4 @@
-{
+so this for my dep pckg json {
   "name": "mineflayer-gemini-bot",
   "version": "1.0.0",
   "main": "bot.js",
@@ -6,9 +6,9 @@
     "start": "node bot.js"
   },
   "dependencies": {
+    "mineflayer": "^4.0.0",
     "@google/genai": "^0.1.0",
-    "mineflayer": "latest",
-    "proxifly": "latest",
-    "socks-proxy-agent": "latest"
+    "socks-proxy-agent": "^8.0.4",
+    "proxifly": "^1.0.0"
   }
 }
