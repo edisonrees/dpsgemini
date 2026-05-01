@@ -1646,28 +1646,30 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
         return;
     }
     // ── BAN / UNBAN COMMAND (DPS only) ────────────────────────────
-    if (role === 'dps') {
-        const banCmd = parseBanCommand(prompt);
-        if (banCmd) {
-            if (banCmd.type === 'ban') {
-                banUser(banCmd.username, banCmd.durationMs);
-                const label = formatDuration(banCmd.durationStr);
-                console.log(`[Ban] ${username} banned ${banCmd.username} for ${label}`);
-                whisperViaPrimary(username, `Done — ${banCmd.username} is banned for ${label}.`);
-                whisperViaPrimary(banCmd.username, `You have been banned from using this bot for ${label}.`);
+    // ── BAN / UNBAN COMMAND (DPS only) ────────────────────────────
+if (role === 'dps') {
+    const banCmd = parseBanCommand(prompt);
+    if (banCmd) {
+        if (banCmd.type === 'ban') {
+            banUser(banCmd.username, banCmd.durationMs);
+            const label = formatDuration(banCmd.durationStr);
+            console.log(`[Ban] ${username} banned ${banCmd.username} for ${label}`);
+
+            whisperViaPrimary(username, `Done — ${banCmd.username} is banned for ${label}.`);
+            whisperViaPrimary(banCmd.username, `You have been banned from using this bot for ${label}.`);
+        } else { // unban
+            const wasFound = unbanUser(banCmd.username);
+            if (wasFound) {
+                console.log(`[Ban] ${username} unbanned ${banCmd.username}`);
+                whisperViaPrimary(username, `Done — ${banCmd.username} has been unbanned.`);
+                whisperViaPrimary(banCmd.username, 'You have been unbanned from using this bot.');
             } else {
-                const wasFound = unbanUser(banCmd.username);
-                if (wasFound) {
-                    console.log(`[Ban] ${username} unbanned ${banCmd.username}`);
-                    whisperViaPrimary(username, `Done — ${banCmd.username} has been unbanned.`);
-                    whisperViaPrimary(banCmd.username, 'You have been unbanned from using this bot.');
-                } else {
-                    whisperViaPrimary(username, `${banCmd.username} isn't currently banned.`);
-                }
+                whisperViaPrimary(username, `${banCmd.username} isn't currently banned.`);
             }
-            return;
         }
+        return;   // ← Important: stop processing after ban command
     }
+}
     // ── DUPLICATE REQUEST GUARD ───────────────────────────────────
     if (pendingRequests.has(username)) {
         console.log(`[Pending] Ignoring duplicate request from ${username}`);
