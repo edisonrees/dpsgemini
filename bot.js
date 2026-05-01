@@ -1341,20 +1341,27 @@ function setupBotEvents() {
                 return;
             }
             // ── PUBLIC CHAT FLOW ──────────────────────────────────
-            const parsed = parsePacket(data);
-            if (!parsed) return;
-            const { realUsername, plainText, hoverStats } = parsed;
-            if (realUsername === bot?.username) return;
-            if (getFleetUsernames().has(realUsername.toLowerCase())) return;
-            if (!botReady) return;
-            if (!hasTrigger(plainText, realUsername)) return;
-            const prompt = stripTrigger(plainText);
-            if (!prompt) {
-                whisperViaPrimary(realUsername, 'Please provide a message after !gemini');
-                return;
-            }
-            console.log(`[Chat] ${realUsername}: ${prompt}`);
-            handleRequest(realUsername, prompt, false, hoverStats);
+            // ── PUBLIC CHAT FLOW ──────────────────────────────────
+const parsed = parsePacket(data);
+if (!parsed) return;
+
+const { realUsername, plainText, hoverStats } = parsed;
+if (realUsername === bot?.username) return;
+if (getFleetUsernames().has(realUsername.toLowerCase())) return;
+if (!botReady) return;
+
+if (!hasTrigger(plainText, realUsername)) return;
+
+const prompt = stripTrigger(plainText);
+if (!prompt) {
+    whisperViaPrimary(realUsername, 'Please provide a message after !gemini');
+    return;
+}
+
+console.log(`[Chat] ${realUsername}: ${prompt}`);
+
+// CHANGED: Always treat public !g commands as whisper responses
+handleRequest(realUsername, prompt, true, hoverStats);
         } catch (err) {
             console.error('[Error] Packet handler:', err);
         }
@@ -1906,6 +1913,9 @@ function sendSmartChat(text, senderUsername, isWhisper) {
  * @param {string} targetUser
  * @param {boolean} isWhisper
  */
+/**
+ * Sends the AI response. Now always whispers when isWhisper=true (which is now always).
+ */
 function sendSmartChatRandom(text, targetUser, isWhisper) {
     if (!text) return;
     try {
@@ -1914,13 +1924,14 @@ function sendSmartChatRandom(text, targetUser, isWhisper) {
             .replace(/\s+/g, ' ')
             .replace(/[*_`#]/g, '')
             .trim();
+
         if (!cleanText) return;
-        // FIX: whispers always go to primary (so /msg replies route correctly).
-        // Public chat (isWhisper=false) goes via a random bot.
+
         if (isWhisper) {
-            // Always use primary for whispers
+            // Always whisper back to the user who asked
             const prefix = `/msg ${targetUser} `;
-            const limit  = 256 - prefix.length - 5;
+            const limit = 256 - prefix.length - 5;
+
             if (cleanText.length <= limit) {
                 enqueuePrimaryChat(`${prefix}${cleanText}`);
             } else {
@@ -1930,7 +1941,7 @@ function sendSmartChatRandom(text, targetUser, isWhisper) {
                 }
             }
         } else {
-            // Public chat via a random bot for variety
+            // This branch should now rarely be hit, but kept for safety
             const limit = 256 - 5;
             const chosen = getRandomBot();
             const sendChunk = (chunk) => {
