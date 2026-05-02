@@ -953,16 +953,56 @@ function commandsContainAdminActions(commands) {
 // ===================================================================
 // SECTION 20 — TRIGGER DETECTION
 // ===================================================================
+// ===================================================================
+// SECTION 20 — TRIGGER DETECTION (YOUR REQUESTED LOGIC)
+// ===================================================================
 function hasTrigger(text, username) {
-    const clean = text.replace(/^\s*<[^>]+>\s*/, '').trim();
-    if (username.toLowerCase() === 'dps_chatbridge') return /!g(?:emini)?\b/i.test(clean);
-    return /(?:^|>)\s*!g(?:emini)?,?\b/i.test(clean);
+    if (!text || typeof text !== 'string') return false;
+
+    const original = text.trim();
+    
+    // Remove cosmetic prefix like <DPS> or <Anything>
+    let cleaned = original.replace(/^\s*<[^>]+>\s*/, '').trim();
+
+    console.log(`[Trigger Debug] Original: "${original}" | Cleaned: "${cleaned}"`);
+
+    const triggerPatterns = [
+        /^!g(?:emini)?\b/i,
+        /^> !g(?:emini)?\b/i,
+        /^>!g(?:emini)?\b/i,
+        /^!g(?:emini)?,/i,
+        /^>!g(?:emini)?,/i,
+        /^> !g(?:emini)?,/i
+    ];
+
+    // Special case for DPS_Chatbridge
+    if (username.toLowerCase() === 'dps_chatbridge') {
+        return triggerPatterns.some(pattern => pattern.test(cleaned));
+    }
+
+    // Normal users
+    return triggerPatterns.some(pattern => pattern.test(cleaned));
 }
 
 function stripTrigger(text) {
-    return text.replace(/^\s*<[^>]+>\s*/, '')
-               .replace(/(?:^|>)\s*!g(?:emini)?,?\s*/gi, '')
-               .trim();
+    if (!text || typeof text !== 'string') return '';
+
+    let cleaned = text.replace(/^\s*<[^>]+>\s*/, '').trim();
+
+    // Remove trigger + optional comma
+    const triggerRemoval = [
+        /^\s*>?\s*!g(?:emini)?\s*,?\s*/i,
+        /^\s*>?\s*!g(?:emini)?\b/i,
+        /^\s*> !g(?:emini)?\s*,?\s*/i,
+        /^\s*>!g(?:emini)?\s*,?\s*/i
+    ];
+
+    for (const regex of triggerRemoval) {
+        cleaned = cleaned.replace(regex, '').trim();
+        if (cleaned !== text) break; // Stop after first successful replacement
+    }
+
+    return cleaned;
 }
 
 // ===================================================================
