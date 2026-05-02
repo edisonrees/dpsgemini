@@ -502,10 +502,18 @@ function getAllAccountCredentials() {
 // -------------------------------------------------------------------
 // SWAPEROO (UPDATED — uses new free proxy list)
 // -------------------------------------------------------------------
+// -------------------------------------------------------------------
+// SWAPEROO (UPDATED — exact registration flow you requested)
+// -------------------------------------------------------------------
 async function swaperoo(requestingUser, count = 5) {
-    if (!isSuperUser(requestingUser)) { whisperViaPrimary(requestingUser, 'Only super users can run swaperoo.'); return; }
-    count = Math.max(1, Math.min(12, parseInt(count) || 5));
-    whisperAllSuperUsers(`[Swaperoo] Starting ${count} account creations using new proxy list...`);
+    if (!isSuperUser(requestingUser)) { 
+        whisperViaPrimary(requestingUser, 'Only super users can run swaperoo.'); 
+        return; 
+    }
+
+    count = Math.max(1, Math.min(100, parseInt(count) || 5));
+
+    whisperAllSuperUsers(`[Swaperoo] Starting ${count} account creations...`);
 
     const https = require('https');
 
@@ -523,11 +531,10 @@ async function swaperoo(requestingUser, count = 5) {
             .split('\n')
             .map(line => line.trim())
             .filter(line => line && (line.startsWith('socks5://') || line.startsWith('socks4://') || line.startsWith('http://')));
-        
+
         console.log(`[Swaperoo] Loaded ${proxyList.length} proxies`);
     } catch (e) {
         console.error('[Swaperoo] Failed to fetch proxy list:', e.message);
-        whisperAllSuperUsers('[Swaperoo] Could not fetch proxy list — falling back to no proxy');
     }
 
     for (let i = 0; i < count; i++) {
@@ -552,32 +559,48 @@ async function swaperoo(requestingUser, count = 5) {
             if (proxy) {
                 opts.agent = new SocksProxyAgent(proxy);
                 opts.skipValidation = true;
-                console.log(`[Swaperoo] Using proxy: ${proxy}`);
             }
 
             const tempBot = mineflayer.createBot(opts);
             let registered = false;
 
             tempBot.once('spawn', () => {
+                console.log(`[Swaperoo] ${username} spawned — waiting 10s for premium prompt...`);
+
+                // EXACT FLOW YOU REQUESTED:
                 setTimeout(() => {
-                    if (registered) return; registered = true;
-                    tempBot.chat(`/register ${password} ${password}`);
+                    if (registered) return;
+                    console.log(`[Swaperoo] ${username} → sending /cracked`);
+                    tempBot.chat('/cracked');
+
                     setTimeout(() => {
-                        whisperViaPrimary(requestingUser, `✅ ${username} | Pass: ${password} ${proxy ? `(proxied)` : '(direct)'}`);
-                        try { tempBot.quit(); } catch {}
-                    }, 6000);
-                }, 20000);
+                        if (registered) return;
+                        registered = true;
+                        console.log(`[Swaperoo] ${username} → sending /register`);
+                        tempBot.chat(`/register ${password} ${password}`);
+
+                        setTimeout(() => {
+                            whisperViaPrimary(requestingUser, `✅ ${username} | Pass: ${password} ${proxy ? `(proxied)` : '(direct)'}`);
+                            try { tempBot.quit(); } catch {}
+                        }, 6000);
+                    }, 5000); // 5 seconds after /cracked
+
+                }, 10000); // 10 seconds after spawn
             });
 
             tempBot.on('error',  e => console.error(`[Swaperoo] ${username} error:`, e.message));
             tempBot.on('kicked', r => console.log(`[Swaperoo] ${username} kicked: ${r}`));
             tempBot.on('end',    () => console.log(`[Swaperoo] ${username} ended`));
+
         } catch (err) {
-            console.error(`[Swaperoo] Failed ${username}:`, err.message);
+            console.error(`[Swaperoo] Failed to create ${username}:`, err.message);
         }
 
         await sleep(9000);
     }
+
+    whisperAllSuperUsers(`[Swaperoo] Completed ${count} attempts.`);
+}
     whisperAllSuperUsers(`[Swaperoo] Completed ${count} attempts.`);
 }// -------------------------------------------------------------------
 // SWAPEROO (UPDATED — uses new free proxy list)
