@@ -954,10 +954,16 @@ function commandsContainAdminActions(commands) {
 // SECTION 20 — TRIGGER DETECTION
 // ===================================================================
 function hasTrigger(text, username) {
-    if (username.toLowerCase() === 'dps_chatbridge') return /!g(?:emini)?\b/i.test(text);
-    return /(?:^|>)\s*!g(?:emini)?,?\b/i.test(text);
+    const clean = text.replace(/^\s*<[^>]+>\s*/, '').trim();
+    if (username.toLowerCase() === 'dps_chatbridge') return /!g(?:emini)?\b/i.test(clean);
+    return /(?:^|>)\s*!g(?:emini)?,?\b/i.test(clean);
 }
-function stripTrigger(text) { return text.replace(/(?:^|>)\s*!g(?:emini)?,?\s*/gi, '').trim(); }
+
+function stripTrigger(text) {
+    return text.replace(/^\s*<[^>]+>\s*/, '')
+               .replace(/(?:^|>)\s*!g(?:emini)?,?\s*/gi, '')
+               .trim();
+}
 
 // ===================================================================
 // SECTION 21 — COMPONENT TREE HELPERS
@@ -1046,30 +1052,66 @@ function parseWhisperPacket(data) {
 // ===================================================================
 function extractPlainTextFromData(data) {
     const candidates = [data.message, data.signedChat, data.unsignedContent, data.chatMessage, data.data, data.content];
+    
     for (const raw of candidates) {
         if (!raw) continue;
+        
         let component;
-        try { component = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { continue; }
-        if (typeof component !== 'object' || component === null) { if (typeof raw === 'string') return raw; continue; }
-        const text = componentToPlainText(component);
-        if (text) return text;
+        try {
+            component = typeof raw === 'string' && raw.trim().startsWith('{') 
+                ? JSON.parse(raw) 
+                : raw;
+        } catch { 
+            if (typeof raw === 'string') return raw; 
+            continue; 
+        }
+
+        if (typeof component === 'object' && component !== null) {
+            const text = componentToPlainText(component);
+            if (text) return text;
+        } else if (typeof raw === 'string') {
+            return raw;
+        }
     }
     return null;
 }
 
 function tryExtractSenderFromPacket(data) {
     const candidates = [data.message, data.signedChat, data.unsignedContent, data.chatMessage, data.data, data.content];
+    
     for (const raw of candidates) {
         if (!raw) continue;
+        
         let component;
-        try { component = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { continue; }
+        try {
+            component = typeof raw === 'string' && raw.trim().startsWith('{') 
+                ? JSON.parse(raw) 
+                : raw;
+        } catch { continue; }
+
         if (typeof component !== 'object' || component === null) continue;
-        const cv = findClickEventValue(component);
-        if (cv) return cv.replace(/^\/msg\s+/, '').trim();
+
+        // PRIMARY: Use clickEvent (most reliable on 8b8t with cosmetics)
+        const clickValue = findClickEventValue(component);
+        if (clickValue) {
+            return clickValue.replace(/^\/msg\s+/, '').trim();
+        }
+
+        // Fallback: clean text extraction and strip common prefixes
+        const plain = componentToPlainText(component);
+        if (plain) {
+            // Strip common cosmetic prefixes like <DPS>, [TAG], etc.
+            let cleaned = plain.replace(/^\s*<[^>]+>\s*/, '')           // <DPS>
+                               .replace(/^\s*\[[^\]]+\]\s*/, '')         // [TAG]
+                               .replace(/^\s*«[^»]+»\s*/, '')           // «TAG»
+                               .trim();
+            
+            // Extract username from <username> or just first word
+            const usernameMatch = cleaned.match(/^<(\w+)>/) || cleaned.match(/^(\w+)/);
+            if (usernameMatch) return usernameMatch[1];
+        }
     }
-    const plain = extractPlainTextFromData(data);
-    if (!plain) return null;
-    return plain.match(/^<(\w+)>/)?.[1] ?? plain.match(/^\[[^\]]*\]\s*(\w+)/)?.[1] ?? null;
+    return null;
 }
 
 // ===================================================================
@@ -1319,20 +1361,27 @@ Online temporary users: ${tempOnline}`;
 // ===================================================================
 // SECTION 28 — CORE HANDLER
 // ===================================================================
+// ===================================================================
+// SECTION 28 — CORE HANDLER (FIXED)
+// ===================================================================
 async function handleRequest(username, message, isWhisper, hoverStats = null) {
     if (!username || !message) return;
 
-    // ── SUPER-USER IDENTITY / CONTROL COMMANDS ────────────────────
-    const { command: identCmd, rest: identRest } = parseIdentityCommand(message.trim());
-    if (identCmd) {
-        if (!isSuperUser(username)) { console.log(`[Identity] ${username} tried !${identCmd} — not super user`); return; }
+    const rawText = message.trim();
+    const cleanText = rawText.replace(/^\s*<[^>]+>\s*/, '').trim(); // Strip cosmetic prefix early
 
+    // === SUPER USER IDENTITY COMMANDS ===
+    const { command: identCmd, rest: identRest } = parseIdentityCommand(rawText);
+    if (identCmd && isSuperUser(username)) {
         if (identCmd === 'switch') {
             const n = parseInt(identRest, 10);
             switchIdentity('switch', (!isNaN(n) && n >= 1 && n <= 5) ? n : (Math.floor(Math.random() * 5) + 1), username);
             return;
         }
-        if (identCmd === 'loadallofthembutthisisextremelyillegal') { swaperoo(username, parseInt(identRest) || 5); return; }
+        if (identCmd === 'loadallofthembutthisisextremelyillegal') { 
+            swaperoo(username, parseInt(identRest) || 5); 
+            return; 
+        }
         if (identCmd === 'incognito') {
             const n = parseInt(identRest, 10);
             switchIdentity('incognito', (!isNaN(n) && n >= 1 && n <= 8) ? n : (Math.floor(Math.random() * 8) + 1), username);
@@ -1366,27 +1415,15 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
         }
     }
 
-    // ── BOT READINESS GATE ─────────────────────────────────────────
-    if (!bot || !botReady || !bot.chat || !bot._client) return;
-    if (username.toLowerCase() === bot.username.toLowerCase()) return;
-
-    // ── ROLE CHECK ─────────────────────────────────────────────────
     const role = getUserRole(username);
-    if (role === 'none') { console.log(`[Blocked] ${username} not approved`); return; }
-
-    // ── BAN CHECK ──────────────────────────────────────────────────
-    if (isUserBanned(username)) {
-        const rem = banTimeRemaining(username);
-        whisperViaPrimary(username, `You are banned from using this bot (${rem ?? 'for a while'} remaining).`);
-        return;
+    if (role === 'none') { 
+        console.log(`[Blocked] ${username} not approved`); 
+        return; 
     }
 
-    const prompt = message.trim();
-    if (!prompt) { whisperViaPrimary(username, 'Please provide a message after !gemini'); return; }
-
-    // ── BAN / UNBAN COMMAND (DPS only) ────────────────────────────
+    // === BAN / UNBAN / RATELIMIT (DPS only) ===
     if (role === 'dps') {
-        const banCmd = parseBanCommand(prompt);
+        const banCmd = parseBanCommand(rawText);
         if (banCmd) {
             if (banCmd.type === 'ban') {
                 banUser(banCmd.username, banCmd.durationMs);
@@ -1405,15 +1442,27 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
             return;
         }
 
-        // ── RATELIMIT COMMAND (DPS only, no ! prefix needed when whispering) ─
-        // Handles: "ratelimit Steve 10" or "!ratelimit Steve 10" whispered directly
-        // (The !ratelimit with ! is caught above in parseIdentityCommand for super-users.
-        //  This catches DPS members whispering "ratelimit ..." without !)
-        const rlMatch = prompt.match(/^!?ratelimit\b\s*(.*)/i);
+        const rlMatch = rawText.match(/^!?ratelimit\b\s*(.*)/i);
         if (rlMatch) {
             handleRatelimitCommand(username, rlMatch[1]);
             return;
         }
+    }
+
+    // === BAN CHECK ===
+    if (isUserBanned(username)) {
+        const rem = banTimeRemaining(username);
+        whisperViaPrimary(username, `You are banned from using this bot (${rem ?? 'for a while'} remaining).`);
+        return;
+    }
+
+    // === TRIGGER CHECK ===
+    if (!hasTrigger(cleanText, username)) return;
+
+    const prompt = stripTrigger(cleanText);
+    if (!prompt) {
+        whisperViaPrimary(username, 'Please provide a message after !gemini');
+        return;
     }
 
     // ── RATELIMIT CHECK ────────────────────────────────────────────
@@ -1425,11 +1474,12 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
     }
 
     // ── DUPLICATE REQUEST GUARD ────────────────────────────────────
-    if (pendingRequests.has(username)) { console.log(`[Pending] Ignoring duplicate from ${username}`); return; }
+    if (pendingRequests.has(username)) { 
+        console.log(`[Pending] Ignoring duplicate from ${username}`); 
+        return; 
+    }
     pendingRequests.add(username);
 
-    // Record timestamp BEFORE processing so concurrent requests from the
-    // same user are blocked even if the API call is in flight
     recordMessageTimestamp(username);
 
     try {
