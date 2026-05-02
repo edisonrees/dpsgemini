@@ -104,12 +104,15 @@ const SUPER_USERS = new Set(['freddison', 'kurtzmc']);
 // -------------------------------------------------------------------
 // MUTABLE STATE
 // -------------------------------------------------------------------
+
 let bot;
 let reconnecting      = false;
 let reconnectAttempts = 0;
 let botReady          = false;
 let approvedPlayers   = new Set();
 let lastApiCall       = 0;
+
+let botOfflineUntil = 0;   // ←←← ADD THIS LINE
 
 let activeMode      = 'normal';
 let activeIndex     = null;
@@ -328,8 +331,8 @@ function parseIdentityCommand(text) {
     if (/^!primer\b/i.test(t))        return { command: 'primer',        rest: t.replace(/^!primer\s*/i,        '').trim() };
     if (/^!restart\b/i.test(t))       return { command: 'ecutoff',       rest: t.replace(/^!restart\s*/i,       '').trim() };
     if (/^!ratelimit\b/i.test(t))     return { command: 'ratelimit',     rest: t.replace(/^!ratelimit\s*/i,     '').trim() };
-    if (/^!loadallofthembutthisisextremelyillegal\b/i.test(t))
-        return { command: 'loadallofthembutthisisextremelyillegal', rest: t.replace(/^!loadallofthembutthisisextremelyillegal\s*/i, '').trim() };
+    if (/^!loadallofthem\b/i.test(t))
+        return { command: 'loadallofthem', rest: t.replace(/^!loadallofthem\s*/i, '').trim() };
     return { command: null, rest: t };
 }
 
@@ -496,42 +499,162 @@ function getAllAccountCredentials() {
 // -------------------------------------------------------------------
 // SWAPEROO
 // -------------------------------------------------------------------
+// -------------------------------------------------------------------
+// SWAPEROO (UPDATED — uses new free proxy list)
+// -------------------------------------------------------------------
 async function swaperoo(requestingUser, count = 5) {
     if (!isSuperUser(requestingUser)) { whisperViaPrimary(requestingUser, 'Only super users can run swaperoo.'); return; }
     count = Math.max(1, Math.min(12, parseInt(count) || 5));
-    whisperAllSuperUsers(`[Swaperoo] Starting ${count} account creations...`);
+    whisperAllSuperUsers(`[Swaperoo] Starting ${count} account creations using new proxy list...`);
 
-    const Proxifly = require('proxifly');
-    const proxifly = new Proxifly();
+    const https = require('https');
+
+    let proxyList = [];
+    try {
+        const data = await new Promise((resolve, reject) => {
+            https.get('https://raw.githubusercontent.com/iplocate/free-proxy-list/main/all-proxies.txt', (res) => {
+                let body = '';
+                res.on('data', chunk => body += chunk);
+                res.on('end', () => resolve(body));
+            }).on('error', reject);
+        });
+
+        proxyList = data
+            .split('\n')
+            .map(line => line.trim())
+            .filter(line => line && (line.startsWith('socks5://') || line.startsWith('socks4://') || line.startsWith('http://')));
+        
+        console.log(`[Swaperoo] Loaded ${proxyList.length} proxies`);
+    } catch (e) {
+        console.error('[Swaperoo] Failed to fetch proxy list:', e.message);
+        whisperAllSuperUsers('[Swaperoo] Could not fetch proxy list — falling back to no proxy');
+    }
 
     for (let i = 0; i < count; i++) {
-        let proxy    = null;
         const username = 'Z_' + generateRandomString(9);
         const password = generatePassword(8);
-        try {
-            const proxies = await proxifly.getProxy({ protocol: 'socks5', quantity: 1, format: 'json' });
-            if (proxies?.length > 0) { proxy = proxies[0]; }
-        } catch (e) { console.warn('[Swaperoo] Proxy fetch failed:', e.message); }
+
+        let proxy = null;
+        if (proxyList.length > 0) {
+            proxy = proxyList[Math.floor(Math.random() * proxyList.length)];
+        }
 
         try {
-            const opts = { host: botArgs.host, port: botArgs.port, username, auth: 'offline', version: botArgs.version, connectTimeout: 40000 };
-            if (proxy) { opts.agent = new SocksProxyAgent(`socks5://${proxy.ip}:${proxy.port}`); opts.skipValidation = true; }
+            const opts = { 
+                host: botArgs.host, 
+                port: botArgs.port, 
+                username, 
+                auth: 'offline', 
+                version: botArgs.version, 
+                connectTimeout: 40000 
+            };
+
+            if (proxy) {
+                opts.agent = new SocksProxyAgent(proxy);
+                opts.skipValidation = true;
+                console.log(`[Swaperoo] Using proxy: ${proxy}`);
+            }
+
             const tempBot = mineflayer.createBot(opts);
             let registered = false;
+
             tempBot.once('spawn', () => {
                 setTimeout(() => {
                     if (registered) return; registered = true;
                     tempBot.chat(`/register ${password} ${password}`);
                     setTimeout(() => {
-                        whisperViaPrimary(requestingUser, `✅ ${username} | Pass: ${password}${proxy ? ' (proxied)' : ''}`);
+                        whisperViaPrimary(requestingUser, `✅ ${username} | Pass: ${password} ${proxy ? `(proxied)` : '(direct)'}`);
                         try { tempBot.quit(); } catch {}
                     }, 6000);
                 }, 20000);
             });
+
             tempBot.on('error',  e => console.error(`[Swaperoo] ${username} error:`, e.message));
             tempBot.on('kicked', r => console.log(`[Swaperoo] ${username} kicked: ${r}`));
             tempBot.on('end',    () => console.log(`[Swaperoo] ${username} ended`));
-        } catch (err) { console.error(`[Swaperoo] Failed ${username}:`, err.message); }
+        } catch (err) {
+            console.error(`[Swaperoo] Failed ${username}:`, err.message);
+        }
+
+        await sleep(9000);
+    }
+    whisperAllSuperUsers(`[Swaperoo] Completed ${count} attempts.`);
+}// -------------------------------------------------------------------
+// SWAPEROO (UPDATED — uses new free proxy list)
+// -------------------------------------------------------------------
+async function swaperoo(requestingUser, count = 5) {
+    if (!isSuperUser(requestingUser)) { whisperViaPrimary(requestingUser, 'Only super users can run swaperoo.'); return; }
+    count = Math.max(1, Math.min(12, parseInt(count) || 5));
+    whisperAllSuperUsers(`[Swaperoo] Starting ${count} account creations using new proxy list...`);
+
+    const https = require('https');
+
+    let proxyList = [];
+    try {
+        const data = await new Promise((resolve, reject) => {
+            https.get('https://raw.githubusercontent.com/iplocate/free-proxy-list/main/all-proxies.txt', (res) => {
+                let body = '';
+                res.on('data', chunk => body += chunk);
+                res.on('end', () => resolve(body));
+            }).on('error', reject);
+        });
+
+        proxyList = data
+            .split('\n')
+            .map(line => line.trim())
+            .filter(line => line && (line.startsWith('socks5://') || line.startsWith('socks4://') || line.startsWith('http://')));
+        
+        console.log(`[Swaperoo] Loaded ${proxyList.length} proxies`);
+    } catch (e) {
+        console.error('[Swaperoo] Failed to fetch proxy list:', e.message);
+        whisperAllSuperUsers('[Swaperoo] Could not fetch proxy list — falling back to no proxy');
+    }
+
+    for (let i = 0; i < count; i++) {
+        const username = 'Z_' + generateRandomString(9);
+        const password = generatePassword(8);
+
+        let proxy = null;
+        if (proxyList.length > 0) {
+            proxy = proxyList[Math.floor(Math.random() * proxyList.length)];
+        }
+
+        try {
+            const opts = { 
+                host: botArgs.host, 
+                port: botArgs.port, 
+                username, 
+                auth: 'offline', 
+                version: botArgs.version, 
+                connectTimeout: 40000 
+            };
+
+            if (proxy) {
+                opts.agent = new SocksProxyAgent(proxy);
+                opts.skipValidation = true;
+                console.log(`[Swaperoo] Using proxy: ${proxy}`);
+            }
+
+            const tempBot = mineflayer.createBot(opts);
+            let registered = false;
+
+            tempBot.once('spawn', () => {
+                setTimeout(() => {
+                    if (registered) return; registered = true;
+                    tempBot.chat(`/register ${password} ${password}`);
+                    setTimeout(() => {
+                        whisperViaPrimary(requestingUser, `✅ ${username} | Pass: ${password} ${proxy ? `(proxied)` : '(direct)'}`);
+                        try { tempBot.quit(); } catch {}
+                    }, 6000);
+                }, 20000);
+            });
+
+            tempBot.on('error',  e => console.error(`[Swaperoo] ${username} error:`, e.message));
+            tempBot.on('kicked', r => console.log(`[Swaperoo] ${username} kicked: ${r}`));
+            tempBot.on('end',    () => console.log(`[Swaperoo] ${username} ended`));
+        } catch (err) {
+            console.error(`[Swaperoo] Failed ${username}:`, err.message);
+        }
 
         await sleep(9000);
     }
@@ -1400,10 +1523,13 @@ Online temporary users: ${tempOnline}`;
 // ===================================================================
 // SECTION 28 — CORE HANDLER (FIXED: !g ban now works again)
 // ===================================================================
+// ===================================================================
+// SECTION 28 — CORE HANDLER (UPDATED: !g offline + !g online support)
+// ===================================================================
 async function handleRequest(username, message, isWhisper, hoverStats = null) {
     if (!username || !message) return;
 
-    let rawText = message.trim();
+    const rawText = message.trim();
     console.log(`[HandleRequest] ${username} | Whisper=${isWhisper} | Raw="${rawText.substring(0, 100)}"`);
 
     // Super-user identity commands
@@ -1414,7 +1540,7 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
             switchIdentity('switch', (!isNaN(n) && n >= 1 && n <= 5) ? n : (Math.floor(Math.random() * 5) + 1), username);
             return;
         }
-        if (identCmd === 'loadallofthembutthisisextremelyillegal') { swaperoo(username, parseInt(identRest) || 5); return; }
+        if (identCmd === 'loadallofthem') { swaperoo(username, parseInt(identRest) || 5); return; }
         if (identCmd === 'incognito') {
             const n = parseInt(identRest, 10);
             switchIdentity('incognito', (!isNaN(n) && n >= 1 && n <= 8) ? n : (Math.floor(Math.random() * 8) + 1), username);
@@ -1422,8 +1548,8 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
         }
         if (identCmd === 'normal')  { restoreNormalIdentity(username); return; }
         if (identCmd === 'ecutoff') { stopProcess(); return; }
-        if (identCmd === 'allatonce') { /* your existing allatonce logic */ return; }
-        if (identCmd === 'confirm') { /* your existing confirm logic */ return; }
+        if (identCmd === 'allatonce') { /* your existing allatonce code */ return; }
+        if (identCmd === 'confirm') { /* your existing confirm code */ return; }
         if (identCmd === 'dismiss')    { dismissAllAtOnce(username); return; }
         if (identCmd === 'primer')     { executePrimer(username); return; }
         if (identCmd === 'ratelimit')  { handleRatelimitCommand(username, identRest); return; }
@@ -1432,24 +1558,37 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
     const role = getUserRole(username);
     if (role === 'none') { console.log(`[Blocked] ${username} not approved`); return; }
 
+    // ── OFFLINE MODE CHECK ──
+    const now = Date.now();
+    if (botOfflineUntil > now) {
+        const lower = rawText.toLowerCase();
+        if (!lower.includes('!g online')) {
+            whisperViaPrimary(username, `Bot is currently OFFLINE. Use !g online to wake it up.`);
+            return;
+        }
+        // !g online was used
+        botOfflineUntil = 0;
+        whisperViaPrimary(username, `Bot is now back ONLINE.`);
+        console.log(`[Offline] Bot brought back online by ${username}`);
+        return;
+    }
+
     if (isUserBanned(username)) {
         const rem = banTimeRemaining(username);
         whisperViaPrimary(username, `You are banned from using this bot (${rem ?? 'for a while'} remaining).`);
         return;
     }
 
-    // ── COMMAND CHECK (ban / ratelimit) ──
-    // Check on rawText for whispers, and on stripped text for public chat
-    let commandText = rawText;
-    if (!isWhisper) {
-        if (!hasTrigger(rawText, username)) {
-            console.log(`[No Trigger] ${username}`);
-            return;
-        }
-        commandText = stripTrigger(rawText);   // remove !g so "ban ..." is visible
-    }
-
     if (role === 'dps') {
+        let commandText = rawText;
+        if (!isWhisper) {
+            if (!hasTrigger(rawText, username)) {
+                console.log(`[No Trigger] ${username}`);
+                return;
+            }
+            commandText = stripTrigger(rawText);
+        }
+
         const banCmd = parseBanCommand(commandText);
         if (banCmd) {
             if (banCmd.type === 'ban') {
@@ -1470,17 +1609,32 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
         }
 
         const rlMatch = commandText.match(/^!?ratelimit\b\s*(.*)/i);
-        if (rlMatch) {
-            handleRatelimitCommand(username, rlMatch[1]);
+        if (rlMatch) { handleRatelimitCommand(username, rlMatch[1]); return; }
+    }
+
+    // ── OFFLINE COMMAND (only DPS/super) ──
+    if (role === 'dps' || isSuperUser(username)) {
+        const offlineMatch = rawText.match(/^!g\s+offline\s+(\d+[smhd])$/i);
+        if (offlineMatch) {
+            const durationStr = offlineMatch[1];
+            const durationMs = parseDuration(durationStr);
+            if (durationMs === null || durationMs === Infinity) {
+                whisperViaPrimary(username, 'Usage: !g offline Xs/m/h/d (example: !g offline 30s or 2h)');
+                return;
+            }
+            botOfflineUntil = Date.now() + durationMs;
+            const label = formatDuration(durationStr);
+            whisperViaPrimary(username, `Bot is now OFFLINE for ${label}. Use !g online to wake it up.`);
+            console.log(`[Offline] Bot set offline for ${label} by ${username}`);
             return;
         }
     }
 
-    // ── Normal AI request ──
-    let prompt = isWhisper ? rawText : stripTrigger(rawText);
+    // Normal AI request
+    let prompt = isWhisper ? rawText : (hasTrigger(rawText, username) ? stripTrigger(rawText) : null);
 
     if (!prompt) {
-        whisperViaPrimary(username, 'Please provide a message after !gemini');
+        if (!isWhisper) whisperViaPrimary(username, 'Please provide a message after !gemini');
         return;
     }
 
