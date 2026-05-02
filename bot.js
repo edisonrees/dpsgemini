@@ -956,52 +956,36 @@ function commandsContainAdminActions(commands) {
 // ===================================================================
 // SECTION 20 — TRIGGER DETECTION (YOUR REQUESTED LOGIC)
 // ===================================================================
+// ===================================================================
+// SECTION 20 — TRIGGER DETECTION (FIXED)
+// ===================================================================
 function hasTrigger(text, username) {
     if (!text || typeof text !== 'string') return false;
-
     const original = text.trim();
+    const cleaned = original.replace(/^\s*<[^>]+>\s*/, '').trim();
     
-    // Remove cosmetic prefix like <DPS> or <Anything>
-    let cleaned = original.replace(/^\s*<[^>]+>\s*/, '').trim();
-
     console.log(`[Trigger Debug] Original: "${original}" | Cleaned: "${cleaned}"`);
-
-    const triggerPatterns = [
+    
+    const patterns = [
         /^!g(?:emini)?\b/i,
-        /^> !g(?:emini)?\b/i,
         /^>!g(?:emini)?\b/i,
+        /^> !g(?:emini)?\b/i,
         /^!g(?:emini)?,/i,
         /^>!g(?:emini)?,/i,
         /^> !g(?:emini)?,/i
     ];
-
-    // Special case for DPS_Chatbridge
-    if (username.toLowerCase() === 'dps_chatbridge') {
-        return triggerPatterns.some(pattern => pattern.test(cleaned));
-    }
-
-    // Normal users
-    return triggerPatterns.some(pattern => pattern.test(cleaned));
+    return patterns.some(p => p.test(cleaned));
 }
 
 function stripTrigger(text) {
     if (!text || typeof text !== 'string') return '';
-
     let cleaned = text.replace(/^\s*<[^>]+>\s*/, '').trim();
-
-    // Remove trigger + optional comma
-    const triggerRemoval = [
-        /^\s*>?\s*!g(?:emini)?\s*,?\s*/i,
-        /^\s*>?\s*!g(?:emini)?\b/i,
-        /^\s*> !g(?:emini)?\s*,?\s*/i,
-        /^\s*>!g(?:emini)?\s*,?\s*/i
-    ];
-
-    for (const regex of triggerRemoval) {
-        cleaned = cleaned.replace(regex, '').trim();
-        if (cleaned !== text) break; // Stop after first successful replacement
-    }
-
+    cleaned = cleaned
+        .replace(/^\s*>?\s*!g(?:emini)?\s*,?\s*/i, '')
+        .replace(/^\s*>?\s*!g(?:emini)?\b/i, '')
+        .replace(/^\s*> !g(?:emini)?\s*,?\s*/i, '')
+        .replace(/^\s*>!g(?:emini)?\s*,?\s*/i, '')
+        .trim();
     return cleaned;
 }
 
@@ -1188,13 +1172,13 @@ function setupBotEvents() {
     });
 
     // ── PACKET HANDLER ─────────────────────────────────────────────
-    const packetHandler = (data, meta) => {
+        const packetHandler = (data, meta) => {
         try {
             if (!['chat','player_chat','system_chat','profileless_chat'].includes(meta.name)) return;
 
-            // ── SUPER-USER BARE COMMANDS ───────────────────────────
             const rawText = extractPlainTextFromData(data);
             const sender  = tryExtractSenderFromPacket(data);
+
             if (rawText && sender && isSuperUser(sender)) {
                 const stripped = rawText.replace(/^\[[^\]]+\]\s*/g, '').replace(/^<[^>]+>\s*/g, '').trim();
                 const { command } = parseIdentityCommand(stripped);
@@ -1203,37 +1187,33 @@ function setupBotEvents() {
                     const now = Date.now();
                     if (!recentSuperCommands.has(key) || now - recentSuperCommands.get(key) > 3000) {
                         recentSuperCommands.set(key, now);
-                        handleRequest(sender, stripped, false, null).catch(e => console.error('[SuperCmd]', e));
+                        handleRequest(sender, stripped, false, null);
                     }
                     return;
                 }
             }
 
-            // ── WHISPER FLOW ───────────────────────────────────────
             const whisper = parseWhisperPacket(data);
             if (whisper) {
                 const { realUsername, message } = whisper;
-                if (realUsername === bot?.username) return;
-                if (getFleetUsernames().has(realUsername.toLowerCase())) return;
+                if (realUsername === bot?.username || getFleetUsernames().has(realUsername.toLowerCase())) return;
                 if (handledByPacket.has(realUsername)) clearTimeout(handledByPacket.get(realUsername));
                 handledByPacket.set(realUsername, setTimeout(() => handledByPacket.delete(realUsername), HANDLED_PACKET_TTL));
                 handleRequest(realUsername, message, true);
                 return;
             }
 
-            // ── PUBLIC CHAT FLOW ───────────────────────────────────
+            // PUBLIC CHAT FLOW — FIXED
             const parsed = parsePacket(data);
-            if (!parsed) return;
-            const { realUsername, plainText, hoverStats } = parsed;
-            if (realUsername === bot?.username) return;
-            if (getFleetUsernames().has(realUsername.toLowerCase())) return;
+            let realUsername = parsed?.realUsername || tryExtractSenderFromPacket(data);
+            let plainText = parsed?.plainText || extractPlainTextFromData(data);
+
+            if (!realUsername || realUsername === bot?.username || getFleetUsernames().has(realUsername.toLowerCase())) return;
             if (!botReady) return;
-            if (!hasTrigger(plainText, realUsername)) return;
-            const prompt = stripTrigger(plainText);
-            if (!prompt) { whisperViaPrimary(realUsername, 'Please provide a message after !gemini'); return; }
-            console.log(`[Chat] ${realUsername}: ${prompt}`);
-            // Public !g → public reply
-            handleRequest(realUsername, prompt, false, hoverStats);
+
+            console.log(`[Chat Raw] ${realUsername}: "${plainText}"`);
+            handleRequest(realUsername, plainText, false, parsed?.hoverStats);
+
         } catch (err) { console.error('[Error] Packet handler:', err); }
     };
 
@@ -1407,13 +1387,16 @@ Online temporary users: ${tempOnline}`;
 // ===================================================================
 // SECTION 28 — CORE HANDLER (CRITICAL FIX)
 // ===================================================================
+// ===================================================================
+// SECTION 28 — CORE HANDLER (FIXED)
+// ===================================================================
 async function handleRequest(username, message, isWhisper, hoverStats = null) {
     if (!username || !message) return;
 
     const rawText = message.trim();
-    const cleanText = rawText.replace(/^\s*<[^>]+>\s*/, '').trim(); // Remove <DPS> etc.
+    console.log(`[HandleRequest] ${username} | Whisper=${isWhisper} | Raw="${rawText.substring(0, 100)}"`);
 
-    // 1. SUPER USER IDENTITY COMMANDS
+    // Super user identity commands
     const { command: identCmd, rest: identRest } = parseIdentityCommand(rawText);
     if (identCmd && isSuperUser(username)) {
         if (identCmd === 'switch') {
@@ -1421,9 +1404,7 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
             switchIdentity('switch', (!isNaN(n) && n >= 1 && n <= 5) ? n : (Math.floor(Math.random() * 5) + 1), username);
             return;
         }
-        if (identCmd === 'loadallofthembutthisisextremelyillegal') { 
-            swaperoo(username, parseInt(identRest) || 5); return; 
-        }
+        if (identCmd === 'loadallofthembutthisisextremelyillegal') { swaperoo(username, parseInt(identRest) || 5); return; }
         if (identCmd === 'incognito') {
             const n = parseInt(identRest, 10);
             switchIdentity('incognito', (!isNaN(n) && n >= 1 && n <= 8) ? n : (Math.floor(Math.random() * 8) + 1), username);
@@ -1431,31 +1412,38 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
         }
         if (identCmd === 'normal')  { restoreNormalIdentity(username); return; }
         if (identCmd === 'ecutoff') { stopProcess(); return; }
-        if (identCmd === 'allatonce') { /* ... your existing allatonce logic ... */ return; }
-        if (identCmd === 'confirm') { /* ... */ return; }
-        if (identCmd === 'dismiss') { dismissAllAtOnce(username); return; }
-        if (identCmd === 'primer')  { executePrimer(username); return; }
-        if (identCmd === 'ratelimit') {
-            handleRatelimitCommand(username, identRest);
+        if (identCmd === 'allatonce') {
+            if (allAtOnceBots.length > 0) { whisperViaPrimary(username, 'Secondary bots already running. Use !dismiss first.'); return; }
+            if (allAtOncePending !== null) { whisperViaPrimary(username, 'An !allatonce confirmation is already pending.'); return; }
+            const usePrimer = !/\bNOPRIMER\b/i.test(identRest);
+            allAtOncePending = username; allAtOncePrimer = usePrimer;
+            whisperViaPrimary(username, `Launch ALL accounts${usePrimer ? ' with PRIMER' : ' WITHOUT primer'}? Whisper !confirm to proceed.`);
+            setTimeout(() => { if (allAtOncePending === username) { allAtOncePending = null; allAtOncePrimer = null; } }, 60_000);
             return;
         }
+        if (identCmd === 'confirm') {
+            if (!allAtOncePending) { whisperViaPrimary(username, 'No pending !allatonce.'); return; }
+            if (allAtOncePending !== username) { whisperViaPrimary(username, `Only ${allAtOncePending} can confirm.`); return; }
+            const usePrimer = allAtOncePrimer !== false;
+            allAtOncePending = null; allAtOncePrimer = null;
+            whisperAllSuperUsers(`${username} confirmed !allatonce — launching.`);
+            launchAllAtOnce(username, usePrimer);
+            return;
+        }
+        if (identCmd === 'dismiss')    { dismissAllAtOnce(username); return; }
+        if (identCmd === 'primer')     { executePrimer(username);    return; }
+        if (identCmd === 'ratelimit')  { handleRatelimitCommand(username, identRest); return; }
     }
 
-    // 2. Get role + basic checks
     const role = getUserRole(username);
-    if (role === 'none') {
-        console.log(`[Blocked] ${username} not approved`);
-        return;
-    }
+    if (role === 'none') { console.log(`[Blocked] ${username} not approved`); return; }
 
-    // 3. Ban check
     if (isUserBanned(username)) {
         const rem = banTimeRemaining(username);
         whisperViaPrimary(username, `You are banned from using this bot (${rem ?? 'for a while'} remaining).`);
         return;
     }
 
-    // 4. DPS Commands (ban, ratelimit)
     if (role === 'dps') {
         const banCmd = parseBanCommand(rawText);
         if (banCmd) {
@@ -1475,34 +1463,27 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
             }
             return;
         }
-
         const rlMatch = rawText.match(/^!?ratelimit\b\s*(.*)/i);
-        if (rlMatch) {
-            handleRatelimitCommand(username, rlMatch[1]);
-            return;
-        }
+        if (rlMatch) { handleRatelimitCommand(username, rlMatch[1]); return; }
     }
 
-    // 5. Check for !g trigger
-    if (!hasTrigger(cleanText, username)) {
-        console.log(`[No Trigger] ${username}: ${cleanText.substring(0, 50)}`);
+    if (!hasTrigger(rawText, username)) {
+        console.log(`[No Trigger] ${username}`);
         return;
     }
 
-    const prompt = stripTrigger(cleanText);
+    const prompt = stripTrigger(rawText);
     if (!prompt) {
         whisperViaPrimary(username, 'Please provide a message after !gemini');
         return;
     }
 
-    // 6. Ratelimit check
     const rl = checkRatelimit(username);
     if (rl.blocked) {
         whisperViaPrimary(username, `Please wait ${rl.waitSec}s before sending another message.`);
         return;
     }
 
-    // 7. Duplicate guard
     if (pendingRequests.has(username)) {
         console.log(`[Pending] Ignoring duplicate from ${username}`);
         return;
