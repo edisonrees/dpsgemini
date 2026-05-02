@@ -1397,13 +1397,16 @@ Online temporary users: ${tempOnline}`;
 // ===================================================================
 // SECTION 28 — CORE HANDLER (FINAL — whispers need no prefix)
 // ===================================================================
+// ===================================================================
+// SECTION 28 — CORE HANDLER (FIXED: !g ban now works again)
+// ===================================================================
 async function handleRequest(username, message, isWhisper, hoverStats = null) {
     if (!username || !message) return;
 
-    const rawText = message.trim();
+    let rawText = message.trim();
     console.log(`[HandleRequest] ${username} | Whisper=${isWhisper} | Raw="${rawText.substring(0, 100)}"`);
 
-    // Super-user commands
+    // Super-user identity commands
     const { command: identCmd, rest: identRest } = parseIdentityCommand(rawText);
     if (identCmd && isSuperUser(username)) {
         if (identCmd === 'switch') {
@@ -1419,8 +1422,8 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
         }
         if (identCmd === 'normal')  { restoreNormalIdentity(username); return; }
         if (identCmd === 'ecutoff') { stopProcess(); return; }
-        if (identCmd === 'allatonce') { /* your existing code */ return; }
-        if (identCmd === 'confirm') { /* your existing code */ return; }
+        if (identCmd === 'allatonce') { /* your existing allatonce logic */ return; }
+        if (identCmd === 'confirm') { /* your existing confirm logic */ return; }
         if (identCmd === 'dismiss')    { dismissAllAtOnce(username); return; }
         if (identCmd === 'primer')     { executePrimer(username); return; }
         if (identCmd === 'ratelimit')  { handleRatelimitCommand(username, identRest); return; }
@@ -1435,8 +1438,19 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
         return;
     }
 
+    // ── COMMAND CHECK (ban / ratelimit) ──
+    // Check on rawText for whispers, and on stripped text for public chat
+    let commandText = rawText;
+    if (!isWhisper) {
+        if (!hasTrigger(rawText, username)) {
+            console.log(`[No Trigger] ${username}`);
+            return;
+        }
+        commandText = stripTrigger(rawText);   // remove !g so "ban ..." is visible
+    }
+
     if (role === 'dps') {
-        const banCmd = parseBanCommand(rawText);
+        const banCmd = parseBanCommand(commandText);
         if (banCmd) {
             if (banCmd.type === 'ban') {
                 banUser(banCmd.username, banCmd.durationMs);
@@ -1454,25 +1468,16 @@ async function handleRequest(username, message, isWhisper, hoverStats = null) {
             }
             return;
         }
-        const rlMatch = rawText.match(/^!?ratelimit\b\s*(.*)/i);
-        if (rlMatch) { handleRatelimitCommand(username, rlMatch[1]); return; }
-    }
 
-    // ── TRIGGER LOGIC ──
-    let prompt;
-    if (isWhisper) {
-        // WHISPERS: NO PREFIX NEEDED — whole message is the prompt
-        prompt = rawText;
-        console.log(`[Whisper Triggered] ${username}: ${prompt}`);
-    } else {
-        // PUBLIC CHAT: still requires !g
-        if (!hasTrigger(rawText, username)) {
-            console.log(`[No Trigger] ${username}`);
+        const rlMatch = commandText.match(/^!?ratelimit\b\s*(.*)/i);
+        if (rlMatch) {
+            handleRatelimitCommand(username, rlMatch[1]);
             return;
         }
-        prompt = stripTrigger(rawText);
-        console.log(`[Chat Triggered] ${username}: ${prompt}`);
     }
+
+    // ── Normal AI request ──
+    let prompt = isWhisper ? rawText : stripTrigger(rawText);
 
     if (!prompt) {
         whisperViaPrimary(username, 'Please provide a message after !gemini');
