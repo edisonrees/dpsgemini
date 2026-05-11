@@ -2,6 +2,7 @@ DPS_Chatbridge
 Exxact0
 KurtzMC
 Engineers
+DPS_Maploader
 i_am_tobias
 Vlesmentie
 KMSA
